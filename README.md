@@ -25,12 +25,19 @@ Auto-Update: 새로운 기능과 버그 수정이 자동으로 업데이트됩�
 
 # 🏎️ Command List
 엔지니어를 활용하기 위해서는 음성 명령어가 필요합니다.
+
 "호출 명령어": "engineer", "mate", "chief", "radio", "hello", "hey" 등
+
 "연료": "fuel", "gas", "petrol", "consumption", "tank" 등
+
 "현재 순위": "rank", "position", "place", "where am i" 등
+
 "현재 랩": "current lap", "lap", "current" 등
+
 "베스트 랩": "best", "fastest", "record", "lap time" 등
+
 "이전 랩": "last", "previous" 등
+
 "거절 명령어": "no", "nope", "negative", "cancel", "nothing", "done", "thanks", "thank you" 등
 
 # 🛠️ Tech Stack
