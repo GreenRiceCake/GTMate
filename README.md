@@ -11,7 +11,7 @@ Hands-free Communication: 운전 중 핸들에서 손을 떼지 않고 음성으
 
 Smart Response: "연료 얼마나 남았어?", "내 베스트 랩은?" 같은 질문에 실제 주행 데이터를 바탕으로 답변합니다.
 
-100% Offline: Vosk와 Piper를 사용하여 인터넷 연결 없이도 빠르고 프라이빗한 음성 서비스를 제공합니다.
+Ultimate Convenience: 디스코드 봇을 통해 음성으로 편리하게 정보를 주고받을수 있습니다.
 
 ### 📊 Real-time Telemetry Dashboard
 Full Data Visualization: 속도, RPM, 기어, 스로틀/브레이크 입력을 한눈에 확인합니다.
@@ -23,8 +23,6 @@ Race Logic: 베스트 랩과 이전 랩 타임을 정밀하게 기록합니다.
 ### 🔄 Seamless Experience
 Auto-Update: 새로운 기능과 버그 수정이 자동으로 업데이트됩니다.
 
-Portable & Clean: 복잡한 설치 과정 없이 실행 파일 하나로 간편하게 시작할 수 있습니다.
-
 # 🛠️ Tech Stack
 Language: Python 3.x
 
@@ -34,4 +32,4 @@ Voice: Vosk (STT), Piper (TTS)
 
 Telemetry: UDP Socket (Salsa20 Decryption)
 
-Audio: SoundDevice, Numpy
+Audio: FFmpeg, numpy, discord bot
