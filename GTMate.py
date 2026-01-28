@@ -13,6 +13,7 @@ import json
 import threading
 import numpy as np
 import discord
+from discord import opus
 from discord.ext import commands, voice_recv
 import vosk
 from dataclasses import dataclass
@@ -39,9 +40,10 @@ SHARED_GAME_STATE = {
     "on_track": False
 }
 
-# [추가] 경로 및 설정
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-if getattr(sys, 'frozen', False): BASE_DIR = os.path.dirname(sys.executable)
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_PATH = os.path.join(BASE_DIR, "bot_config.json")
 PIPER_EXE = os.path.join(BASE_DIR, "bin", "piper.exe")
@@ -49,6 +51,15 @@ PIPER_MODEL = os.path.join(BASE_DIR, "models", "piper", "ttsmodel.onnx")
 VOSK_MODEL_PATH = os.path.join(BASE_DIR, "models", "vosk")
 FFMPEG_EXE = os.path.join(BASE_DIR, "bin", "ffmpeg.exe")
 UPDATER_EXE = os.path.join(BASE_DIR, "Updater.exe")
+opus_path = os.path.join(BASE_DIR, "bin", "libopus.dll")
+
+try:
+    if not discord.opus.is_loaded():
+        # 파일 이름을 직접 주거나 풀 경로를 줍니다.
+        discord.opus.load_opus(opus_path)
+        print(f">>> [성공] Opus 로드 완료: {opus_path}")
+except Exception as e:
+    print(f">>> [실패] Opus 로드 에러: {e}")
 
 # [추가] 봇 상태 상수
 STATE_IDLE = 0
@@ -61,7 +72,6 @@ COMMAND_ALIASES = {
     "fuel": ["fuel", "gas", "petrol", "consumption", "tank", "few", "fill", "few all"],
     "rank": ["rank", "position", "place", "where am i"],
     "current_lap": ["current lap", "lap", "current"],
-    "damage": ["damage", "body", "aero", "engine", "condition", "status", "damn"],
     "best_lap": ["best", "fastest", "record", "lap time"],
     "last_lap": ["last", "previous", "lap time"],
     "no": ["no", "nope", "negative", "cancel", "nothing", "done", "thanks", "thank you"]
@@ -117,7 +127,7 @@ class EngineerBot(commands.Bot):
         # 허용할 단어 리스트 (레이싱 관련 및 호출어)
         grammar_list = [
             "engineer", "mate", "radio", "hello", # 호출어
-            "fuel", "rank", "position", "lap", "previous", "damage", "gap", "best", # 명령어
+            "fuel", "rank", "position", "lap", "previous", "gap", "best", # 명령어
             "yes", "no", "copy", "thanks", "cancel", # 응답
             "[unk]" # 리스트에 없는 단어 처리용
         ]
@@ -208,7 +218,7 @@ class EngineerBot(commands.Bot):
                         await self.handle_interaction("wake")
 
                 elif self.state == STATE_WAITING_COMMAND:
-                    cmd = self.match_keyword(partial, ["fuel", "rank", "damage", "best_lap", "last_lap", "current_lap", "no"])
+                    cmd = self.match_keyword(partial, ["fuel", "rank", "best_lap", "last_lap", "current_lap", "no"])
                     if cmd:
                         self.recognizer.Reset()
                         await self.handle_interaction(cmd)
@@ -345,9 +355,6 @@ class EngineerBot(commands.Bot):
             if data['last_lap_ms'] <= 0: return "No last lap data."
             return f"Last lap was {self.format_time_tts(data['last_lap_ms'])}."
             
-        elif key == "damage":
-            return "Systems look good. No damage." # 데미지는 아직 미구현이라 고정
-            
         return None
 
     def format_time_tts(self, ms):
@@ -364,61 +371,64 @@ class EngineerBot(commands.Bot):
         if not text.strip(): return
         
         self.is_speaking = True
-        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        creation_flags = subprocess.CREATE_NO_WINDOW 
         
-        # [중요] 경로 재확인 및 존재 여부 체크
-        # 만약 FFMPEG_EXE 변수가 전역에 없다면 여기서 직접 정의합니다.
-        current_ffmpeg = os.path.join(BASE_DIR, "bin", "ffmpeg.exe")
-        current_piper = os.path.join(BASE_DIR, "bin", "piper.exe")
-
-        # 파일 존재 여부 콘솔 출력 (디버깅용)
-        if not os.path.exists(current_ffmpeg):
-            print(f">>> [경로오류] FFmpeg 없음: {current_ffmpeg}")
-        if not os.path.exists(current_piper):
-            print(f">>> [경로오류] Piper 없음: {current_piper}")
+        import os
+        import traceback  # 에러 추적을 위해 추가
+        
+        current_env = os.environ.copy()
+        current_env["PYTHONIOENCODING"] = "utf-8"
+        
+        current_ffmpeg = os.path.abspath(os.path.join(BASE_DIR, "bin", "ffmpeg.exe"))
+        current_piper = os.path.abspath(os.path.join(BASE_DIR, "bin", "piper.exe"))
+        abs_model_path = os.path.abspath(PIPER_MODEL if os.path.isabs(PIPER_MODEL) else os.path.join(BASE_DIR, PIPER_MODEL))
 
         try:
             # 1. Piper 실행
-            piper_cmd = [current_piper, "--model", PIPER_MODEL, "--output-raw"]
-            process = subprocess.Popen(piper_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, 
-                                      stderr=subprocess.PIPE, creationflags=creation_flags)
-            out_data, err = process.communicate(input=text.encode('utf-8'), timeout=10)
+            piper_cmd = [current_piper, "--model", abs_model_path, "--output-raw"]
+            process = subprocess.Popen(
+                piper_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=creation_flags, cwd=os.path.dirname(current_piper), env=current_env
+            )
+            out_data, err = process.communicate(input=text.encode('utf-8'), timeout=15)
             
-            if not out_data:
-                print(f">>> [Piper 에러]: {err.decode(errors='ignore')}")
-                return
-
-            # 2. FFmpeg 실행 (문자열이 아닌 '리스트' 형태가 가장 안전함)
-            ffmpeg_cmd = [
-                current_ffmpeg,
-                "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "-",
-                "-f", "s16le", "-ar", "48000", "-ac", "2", "-"
-            ]
-            
-            ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, 
-                                          stderr=subprocess.PIPE, creationflags=creation_flags)
-            pcm_converted, ff_err = ffmpeg_proc.communicate(input=out_data, timeout=10)
+            # 2. FFmpeg 실행
+            ffmpeg_cmd = [current_ffmpeg, "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "-",
+                          "-f", "s16le", "-ar", "48000", "-ac", "2", "-"]
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=creation_flags, cwd=os.path.dirname(current_ffmpeg), env=current_env
+            )
+            pcm_converted, ff_err = ffmpeg_proc.communicate(input=out_data, timeout=15)
             
             if not pcm_converted:
-                print(f">>> [FFmpeg 에러]: {ff_err.decode(errors='ignore')}")
+                print(">>> [에러] 변환된 PCM 데이터가 없습니다.")
                 return
-            
-            # 3. 재생
+
+            # 3. 재생 단계 (여기가 핵심 의심 구간)
             import io
+            print(">>> [디버그] 재생 시도 직전...")
             audio_source = discord.PCMAudio(io.BytesIO(pcm_converted))
-            if self.voice_client.is_playing(): self.voice_client.stop()
+            
+            if self.voice_client.is_playing(): 
+                self.voice_client.stop()
+            
             self.voice_client.play(audio_source)
+            print(">>> [디버그] 재생 함수 호출 성공")
             
             while self.voice_client.is_playing():
                 await asyncio.sleep(0.1)
                 
         except Exception as e:
-            print(f">>> [Bot] TTS Fatal Error: {e}")
+            # 에러의 타입과 상세한 발생 위치를 콘솔에 뿌립니다.
+            print(f">>> [Bot] TTS Fatal Error 발생!")
+            print(f">>> 에러 종류: {type(e).__name__}")
+            print(f">>> 에러 메시지: {e}")
+            traceback.print_exc() # <--- 이게 범인을 잡아줄 겁니다.
+            
         finally:
-            while not self.audio_queue.empty():
-                try: self.audio_queue.get_nowait()
-                except: break
             self.is_speaking = False
+            print(">>> [디버그] speak_tts 종료")
 
 class GT7TelemetryReceiver:
     KEY = b'Simulator Interface Packet GT7 ver 0.0'
@@ -513,11 +523,11 @@ class GT7TelemetryReceiver:
 class RaceDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title("GTMate 1.0.0")
+        self.root.title("GTMate 1.0.1")
         self.root.geometry("1200x800")
         self.root.configure(bg='#000000')
 
-        self.current_version = "1.0.0"
+        self.current_version = "1.0.1"
         self.check_for_update_st()
         
         self.receiver = None
@@ -986,8 +996,8 @@ class RaceDashboard:
         # 색상 로직 (비율 기반이므로 그대로 유지해도 무방합니다)
         color = '#00ff00'
         if pct > 0.9: color = '#87CEEB' # 시프트 라이트 느낌 (하늘색)
-        elif pct > 0.7: color = '#ff0000' # 레드존 근처 (빨간색)
-        elif pct > 0.5: color = '#ffff00' # 중간 (노란색)
+        elif pct > 0.8: color = '#ff0000' # 레드존 근처 (빨간색)
+        elif pct > 0.6: color = '#ffff00' # 중간 (노란색)
         
         # 리미터 작동 시 깜빡임 로직
         if pct > 0.95 and (int(time.time() * 15) % 2 == 0):
