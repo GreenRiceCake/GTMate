@@ -1,8 +1,9 @@
 {
-  "version": "1.0.0",
-  "changelog": "- test1\n- test2",
-  "download_url": ""
+  "version": "1.0.1",
+  "changelog": "- 엔지니어 디스코드 봇이 말을 하지 않던 문제 수정\n- RPM 게이지의 색이 변하는 범위 수정",
+  "download_url": "https://www.dropbox.com/scl/fi/w9cfhmka89tkgeuc3q56o/GTMate.exe?rlkey=7eyvt4nvs9ktt9d0ysxkvvfm7&st=gthoud29&dl=1"
 }
+
 
 
 
