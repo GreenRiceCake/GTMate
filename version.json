@@ -1,8 +1,9 @@
 {
-  "version": "1.0.1",
-  "changelog": "- 엔지니어 디스코드 봇이 말을 하지 않던 문제 수정\n- RPM 게이지의 색이 변하는 범위 수정",
-  "download_url": "https://www.dropbox.com/scl/fi/w9cfhmka89tkgeuc3q56o/GTMate.exe?rlkey=7eyvt4nvs9ktt9d0ysxkvvfm7&st=gthoud29&dl=1"
+  "version": "1.0.2",
+  "changelog": "- 클러치 페달 게이지 추가\n- RPM 최댓값을 해당 차량의 RPM 한계치로 조정",
+  "download_url": "https://www.dropbox.com/scl/fi/0to6jsoze2s8hlz1veqxo/GTMate.exe?rlkey=0cnqz1itfu6gzqy2c2z5cbnso&st=5b914isw&dl=1"
 }
+
 
 
 
