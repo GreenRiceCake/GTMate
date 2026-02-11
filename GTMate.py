@@ -80,8 +80,8 @@ COMMAND_ALIASES = {
 @dataclass
 class TelemetryPacket:
     position: tuple; velocity: tuple; rotation: tuple
-    speed: float; rpm: float; fuel_level: float; fuel_capacity: float
-    throttle: int; brake: int; current_gear: int; suggested_gear: int
+    speed: float; rpm: float; max_rpm: float; fuel_level: float; fuel_capacity: float
+    clutch: float; throttle: int; brake: int; current_gear: int; suggested_gear: int
     tire_temps: tuple; tire_radius: tuple; wheel_rps: tuple
     packet_id: int; lap_count: int; total_laps: int; best_lap: int; last_lap: int
     race_rank: int; total_cars: int
@@ -475,8 +475,10 @@ class GT7TelemetryReceiver:
                 rotation=struct.unpack_from('fff', data, 0x1C),
                 speed=struct.unpack_from('f', data, 0x4C)[0],
                 rpm=struct.unpack_from('f', data, 0x3C)[0],
+                max_rpm=struct.unpack_from('h', data, 0x8A)[0],
                 fuel_level=struct.unpack_from('f', data, 0x44)[0],
                 fuel_capacity=struct.unpack_from('f', data, 0x48)[0],
+                clutch=struct.unpack_from('<f', data, 0xF4)[0],
                 throttle=struct.unpack_from('B', data, 0x91)[0],
                 brake=struct.unpack_from('B', data, 0x92)[0],
                 current_gear=struct.unpack_from('B', data, 0x90)[0] & 0x0F,
@@ -523,11 +525,11 @@ class GT7TelemetryReceiver:
 class RaceDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title("GTMate 1.0.1")
+        self.root.title("GTMate 1.0.2")
         self.root.geometry("1200x800")
         self.root.configure(bg='#000000')
 
-        self.current_version = "1.0.1"
+        self.current_version = "1.0.2"
         self.check_for_update_st()
         
         self.receiver = None
@@ -692,11 +694,13 @@ class RaceDashboard:
         # 입력바
         input_sub = tk.Frame(self.right_col, bg='black')
         input_sub.pack(pady=10)
-        tk.Label(input_sub, text="THR  BRK", bg='black', fg='white', font=('Arial', 12, 'bold')).pack()
-        self.thr_canvas = tk.Canvas(input_sub, width=40, height=250, bg='#222', highlightthickness=0)
-        self.thr_canvas.pack(side=tk.LEFT, padx=10)
+        tk.Label(input_sub, text="CLU      BRK      THR", bg='black', fg='white', font=('Arial', 12, 'bold')).pack()
+        self.clu_canvas = tk.Canvas(input_sub, width=40, height=250, bg='#222', highlightthickness=0)
+        self.clu_canvas.pack(side=tk.LEFT, padx=10)
         self.brk_canvas = tk.Canvas(input_sub, width=40, height=250, bg='#222', highlightthickness=0)
         self.brk_canvas.pack(side=tk.LEFT, padx=10)
+        self.thr_canvas = tk.Canvas(input_sub, width=40, height=250, bg='#222', highlightthickness=0)
+        self.thr_canvas.pack(side=tk.LEFT, padx=10)
 
         # 상태 섹션 (확장)
         self.status_box = tk.Frame(self.right_col, bg='#1a1a1a', pady=10, relief=tk.RIDGE, bd=2)
@@ -771,7 +775,7 @@ class RaceDashboard:
         elif is_moving:
             self.replay_label.config(text="STATUS: REPLAY MODE", fg='yellow')
             self.render_dashboard(p)
-        else:
+        elif p.lap_count == -1:
             self.replay_label.config(text="STATUS: IDLE", fg='#666666')
             self.show_empty_data()
 
@@ -794,7 +798,7 @@ class RaceDashboard:
     def render_dashboard(self, p):
         self.speed_label.config(text=f"{int(p.speed * 3.6)}")
         self.gear_label.config(text="R" if p.current_gear == 0 else ("N" if p.current_gear == 15 else str(p.current_gear)))
-        self.draw_rpm_bar(p.rpm, GT7Flags.check(p.flags, GT7Flags.REV_LIMITER))
+        self.draw_rpm_bar(p.rpm, p.max_rpm, GT7Flags.check(p.flags, GT7Flags.REV_LIMITER))
         
         # 랩타임 업데이트
         if p.best_lap > 0: self.best_lap_label.config(text=self.format_time(p.best_lap))
@@ -977,23 +981,18 @@ class RaceDashboard:
             
         self.draw_vertical_bar(self.thr_canvas, p.throttle / 255, '#00ff00')
         self.draw_vertical_bar(self.brk_canvas, p.brake / 255, '#ff0000')
+        self.draw_vertical_bar(self.clu_canvas, p.clutch, '#00ffff')
         self.lap_count_label.config(text=f"LAP: {p.lap_count} / {max(0, p.total_laps)}")
 
-    def draw_rpm_bar(self, rpm, is_limiter):
+    def draw_rpm_bar(self, rpm, max_rpm, is_limiter):
         self.rpm_canvas.delete("all")
         w = self.rpm_canvas.winfo_width()
         
-        # 1. 동적 최대치 업데이트: 현재 RPM이 기록된 최대치보다 크면 갱신
-        if rpm > self.max_rpm_seen:
-            self.max_rpm_seen = rpm
-        
-        # 2. 비율 계산 (갱신된 max_rpm_seen 기준)
-        # 분모가 0이 되는 것을 방지하기 위해 max(1, ...) 사용
-        pct = min(rpm / max(1, self.max_rpm_seen), 1.0)
+        limit = max_rpm if max_rpm > 0 else 10000
+        pct = min(rpm / limit, 1.0)
         
         fill_w = w * pct
         
-        # 색상 로직 (비율 기반이므로 그대로 유지해도 무방합니다)
         color = '#00ff00'
         if pct > 0.9: color = '#87CEEB' # 시프트 라이트 느낌 (하늘색)
         elif pct > 0.8: color = '#ff0000' # 레드존 근처 (빨간색)
@@ -1048,6 +1047,7 @@ class RaceDashboard:
         self.best_lap_label.config(text="--:--:---")
         self.last_lap_label.config(text="--:--:---")
         self.rpm_canvas.delete("all")
+        self.clu_canvas.delete("all")
         self.thr_canvas.delete("all")
         self.brk_canvas.delete("all")
         self.max_rpm_seen = 5000
