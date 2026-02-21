@@ -1,0 +1,6 @@
+requests
+numpy
+discord.py
+discord-ext-voice-recv
+vosk
+pycryptodome
