@@ -3,5 +3,5 @@
     "title": "GTMate v1.1.0 업데이트",
     "changelog": "- 디스코드 음성 정책 변경에 대응하기 위해 DAVE 기반 음성 수신 구조를 적용했습니다.\n- davey와 discord-ext-voice-recv 조합으로 팀 라디오 음성 인식을 복구했습니다.\n- 음성 인식 반응 속도와 문장 종료 감지를 개선했습니다.\n- 라디오 상태 표시를 추가해 대기, 호출, 명령 인식, 응답 상태를 확인할 수 있게 했습니다.\n- GT7 Packet C 수신을 지원하도록 변경했습니다.\n- 현재 랩타임 표시를 추가했습니다.\n- 베스트랩 갱신 시 엔지니어가 새 베스트랩과 이전 기록 대비 차이를 알려주도록 했습니다.\n- 연료 예측 데이터가 부족할 때 남은 연료와 계산 대기 상태를 자연스럽게 안내하도록 개선했습니다.\n- 저연료 상황에서 남은 랩 수를 엔지니어가 직접 알려주도록 했습니다.\n- STANDBY 상태 진입 시 연료 예측 데이터를 초기화하도록 개선했습니다.\n- 피트 진입, 피트 레인, 핏워크, 피트 아웃 상태를 더 정교하게 감지하도록 개선했습니다.\n- 피트 시퀀스 표시 UI를 추가했습니다.\n- PlayStation IP 자동 검색 기능을 추가했습니다.\n- zip 기반 전체 패키지 업데이트 방식을 지원하는 새 업데이터를 추가했습니다.\n- 업데이트 진행률, 압축 해제, 파일 교체 로그를 볼 수 있는 업데이트 진행 화면을 추가했습니다.\n- PyInstaller 빌드에서 필요한 Python 모듈들이 더 안정적으로 포함되도록 spec 파일을 개선했습니다.\n- 패킷 분석용 datadebug 도구를 추가했습니다.\n- F11 전체 화면 토글과 화면 크기에 맞춘 UI 스케일링을 추가했습니다.",
     "update_type": "zip",
-    "download_url": "https://github.com/GreenRiceCake/GTMate/releases/download/v1.1.0/GTMate_v1.1.0.zip"
+    "download_url": "https://www.dropbox.com/scl/fi/qyv3ll32jp0jzcts30go2/GTMate_v1.1.0.zip?rlkey=4tm3tdlvk68ovkklszramr2br&st=v6jjmy4q&dl=1"
 }
