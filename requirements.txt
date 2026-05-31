@@ -1,6 +1,9 @@
-requests
-numpy
-discord.py
-discord-ext-voice-recv
-vosk
-pycryptodome
+requests==2.31.0
+numpy==2.2.5
+discord.py==2.7.1
+discord-ext-voice-recv==0.5.2a179
+davey==0.1.5
+vosk==0.3.45
+pycryptodome==3.23.0
+PyNaCl==1.5.0
+audioop-lts==0.2.1
