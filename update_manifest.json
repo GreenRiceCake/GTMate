@@ -3,5 +3,5 @@
     "title": "GTMate v1.1.1 업데이트",
     "changelog": "- 피트 감지 방식을 개선해, 피트 진입 장면도 안정적으로 인식하면서 사고로 인한 오인식을 줄였습니다.\n- 랩 또는 순위 정보가 아직 없는 레이스 대기 화면을 STANDBY 상태로 정확히 인식하고, 새 주행을 시작할 때 피트 및 연료 계산 데이터를 깨끗하게 초기화하도록 개선했습니다.\n- PlayStation 텔레메트리 수신이 중단되면 2초 안에 연결 실패 상태로 전환하며, 일시적인 끊김에는 연료 계산과 피트 상태를 보존하도록 개선했습니다.\n- 랩당 연료 소모량이 0.5L 이하인 차량과 짧은 코스에서도 유효 표본을 얻으면 남은 랩 계산을 시작하도록 개선했습니다.\n- 프로그램 창을 먼저 표시한 뒤 백그라운드에서 조용히 업데이트를 확인하도록 시작 과정을 개선했습니다.\n- Discord 설정 파일이 손상되거나 채널 ID가 잘못된 경우에도 안전하게 설정 화면을 열고 사용 가능한 음성 채널을 찾도록 개선했습니다.",
     "update_type": "zip",
-    "download_url": "https://github.com/GreenRiceCake/GTMate/releases/download/v1.1.1/GTMate_v1.1.1.zip"
+    "download_url": "https://www.dropbox.com/scl/fi/jtyhpkjvu7m88ul2348ko/GTMate_v1.1.1.zip?rlkey=kqi5bzbp8g3hw1tmnxy4q8hb3&st=fxp2438g&dl=0"
 }
