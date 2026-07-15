@@ -18,6 +18,7 @@ import discord
 from discord import opus
 from discord.ext import commands, voice_recv
 import vosk
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 import threading
@@ -72,6 +73,21 @@ VOSK_MODEL_PATH = os.path.join(BASE_DIR, "models", "vosk")
 FFMPEG_EXE = os.path.join(BASE_DIR, "bin", "ffmpeg.exe")
 UPDATER_EXE = os.path.join(BASE_DIR, "Updater.exe")
 opus_path = os.path.join(BASE_DIR, "bin", "libopus.dll")
+
+
+def load_bot_config_file():
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            raise ValueError("configuration root must be an object")
+        return config
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f">>> [Config] Failed to load bot configuration: {type(e).__name__}")
+        return {}
 
 try:
     if not discord.opus.is_loaded():
@@ -348,8 +364,18 @@ class EngineerBot(commands.Bot):
         set_radio_ui_state("CONNECTING", f"Logged in as {self.user}")
         # 채널 자동 접속 로직 (설정 파일의 채널 ID 우선)
         cfg = self.load_config()
-        channel_id = cfg.get("CHANNEL_ID")
-        channel = self.get_channel(int(channel_id)) if channel_id else None
+        channel_id = str(cfg.get("CHANNEL_ID") or "").strip()
+        channel = None
+
+        if channel_id:
+            if channel_id.isdigit():
+                configured_channel = self.get_channel(int(channel_id))
+                if isinstance(configured_channel, discord.VoiceChannel):
+                    channel = configured_channel
+                else:
+                    print(">>> [Bot] Configured channel is unavailable or is not a voice channel; using fallback.")
+            else:
+                print(">>> [Bot] Invalid voice channel ID; using fallback.")
         
         if not channel: # 설정 없으면 첫 번째 음성 채널 찾기
             for guild in self.guilds:
@@ -366,6 +392,9 @@ class EngineerBot(commands.Bot):
             set_radio_ui_state("STANDBY", "Waiting for wake word")
             if not self.processing_task:
                 self.processing_task = self.loop.create_task(self.process_audio_queue())
+        else:
+            print(">>> [Bot] No accessible voice channel found.")
+            set_radio_ui_state("ERROR", "No accessible voice channel")
 
     def start_voice_listener(self):
         if not self.voice_client or not self.voice_client.is_connected():
@@ -434,9 +463,7 @@ class EngineerBot(commands.Bot):
             self.listener_restarting = False
 
     def load_config(self):
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, 'r') as f: return json.load(f)
-        return {}
+        return load_bot_config_file()
 
     def sink_callback(self, user, data: voice_recv.VoiceData):
         if user == self.user: return
@@ -979,10 +1006,12 @@ class GT7TelemetryReceiver:
 class RaceDashboard:
     BASE_WINDOW_WIDTH = 1200
     BASE_WINDOW_HEIGHT = 800
+    PIT_ENTRY_LOOKBACK_SECONDS = 0.5
+    FUEL_LAP_RESET_CONFIRM_PACKETS = 3
 
     def __init__(self, root):
         self.root = root
-        self.root.title("GTMate 1.1.0")
+        self.root.title("GTMate 1.1.1")
         self.root.geometry(f"{self.BASE_WINDOW_WIDTH}x{self.BASE_WINDOW_HEIGHT}")
         self.root.configure(bg='#000000')
         self.fullscreen_enabled = False
@@ -993,12 +1022,15 @@ class RaceDashboard:
         self.scalable_progressbars = []
         self.scalable_frames = []
 
-        self.current_version = "1.1.0"
-        self.check_for_update_st()
+        self.current_version = "1.1.1"
+        self.update_check_started = False
         
         self.receiver = None
         self.current_packet = None
         self.last_packet_time = 0
+        self.connection_started_at = 0
+        self.connection_timed_out = False
+        self.connection_watchdog_after_id = None
         self.last_data_val = (0, 0)
         self.last_change_time = 0
         
@@ -1034,6 +1066,8 @@ class RaceDashboard:
         self.low_fuel_alerts_triggered = set()
         self.best_lap_seen_ms = -1
         self.fuel_strategy_reset_for_standby = False
+        self.fuel_lap_reset_candidate = None
+        self.fuel_lap_reset_count = 0
         
         # [화면 표시용 노이즈 필터]
         self.display_fuel_pct = 100.0
@@ -1070,31 +1104,36 @@ class RaceDashboard:
         self.pit_stopped_since = None
         self.pit_box_announced = False
         self.pit_sequence_hide_after_id = None
-        self.pit_entry_history = []
+        self.pit_entry_history = deque()
         self.pit_entry_started_at = None
         self.pit_lane_started_at = None
+        self.connection_watchdog_after_id = self.root.after(500, self.check_connection_watchdog)
+        self.root.after(1000, self.start_silent_update_check)
 
-    def check_for_update_st(self):
-            try:
-                url = "https://raw.githubusercontent.com/GreenRiceCake/GTMate/main/version.json"
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    latest_version = data["version"]
+    def start_silent_update_check(self):
+        if self.update_check_started:
+            return
 
-                    if is_newer_version(latest_version, self.current_version):
-                        # 버전이 낮으면 업데이트 프로그램 실행
-                        if os.path.exists(UPDATER_EXE):
-                            subprocess.Popen([UPDATER_EXE], cwd=BASE_DIR)
-                        else:
-                            print(f"업데이트 프로그램을 찾을 수 없습니다: {UPDATER_EXE}")
-                    else:
-                        print("최신 버전입니다.")
-                else:
-                    print("업데이트 서버에 연결할 수 없습니다.")
+        self.update_check_started = True
+        threading.Thread(target=self.check_for_update_silently, daemon=True).start()
 
-            except Exception as e:
-                print(f"업데이트 확인 중 오류 발생: {e}")
+    def check_for_update_silently(self):
+        try:
+            url = "https://raw.githubusercontent.com/GreenRiceCake/GTMate/main/update_manifest.json"
+            response = requests.get(url, timeout=5)
+            if response.status_code != 200:
+                return
+
+            latest_version = str(response.json().get("version", "")).strip()
+            if not latest_version or not is_newer_version(latest_version, self.current_version):
+                return
+
+            if os.path.exists(UPDATER_EXE):
+                subprocess.Popen([UPDATER_EXE], cwd=BASE_DIR)
+            else:
+                print(f">>> [Update] Updater not found: {UPDATER_EXE}")
+        except Exception as e:
+            print(f">>> [Update] Silent check failed: {e}")
         
     def create_widgets(self):
         # 상단 설정
@@ -1577,6 +1616,10 @@ class RaceDashboard:
         ps_ip = self.ip_entry.get().strip()
         if not ps_ip: return
         self.status_label.config(text="● 연결 시도 중", fg='orange')
+        self.current_packet = None
+        self.last_packet_time = 0
+        self.connection_started_at = time.time()
+        self.connection_timed_out = False
         self.receiver = GT7TelemetryReceiver(ps_ip=ps_ip)
         threading.Thread(target=self.receiver.start, args=(self.update_data,), daemon=True).start()
         self.connect_btn.config(text="Disconnect", bg='#ff0000')
@@ -1585,14 +1628,33 @@ class RaceDashboard:
 
     def stop_connection(self):
         if self.receiver: self.receiver.stop()
+        self.receiver = None
+        self.current_packet = None
+        self.last_packet_time = 0
+        self.connection_started_at = 0
+        self.connection_timed_out = False
         self.status_label.config(text="● 연결 끊김", fg='red')
         self.connect_btn.config(text="Connect PS", bg='#00ff00')
         self.find_ps_btn.config(state='normal')
         self.ip_entry.config(state='normal')
+        self.show_empty_data()
+
+    def check_connection_watchdog(self):
+        if self.receiver and self.receiver.running:
+            reference_time = self.last_packet_time or self.connection_started_at
+            if reference_time and time.time() - reference_time > 2.0:
+                if not self.connection_timed_out:
+                    self.connection_timed_out = True
+                    self.status_label.config(text="● 연결 실패/대기", fg='red')
+                    self.show_connection_lost_data()
+                    print(">>> [PS] Packet timeout: no telemetry received for 2 seconds.")
+
+        self.connection_watchdog_after_id = self.root.after(500, self.check_connection_watchdog)
 
     def update_data(self, packet: TelemetryPacket):
         self.current_packet = packet
         self.last_packet_time = time.time()
+        self.connection_timed_out = False
         SHARED_GAME_STATE['fuel_liters'] = packet.fuel_level
         SHARED_GAME_STATE['fuel_percent'] = (packet.fuel_level / packet.fuel_capacity * 100) if packet.fuel_capacity else 0
         SHARED_GAME_STATE['current_lap'] = packet.lap_count
@@ -1608,9 +1670,11 @@ class RaceDashboard:
         if self.bot and self.bot.loop and self.bot.loop.is_running():
             asyncio.run_coroutine_threadsafe(self.bot.speak_tts(text), self.bot.loop)
 
-    def reset_fuel_strategy(self):
-        if not self.fuel_strategy_reset_for_standby:
+    def reset_fuel_strategy(self, reason="standby"):
+        if reason == "standby" and not self.fuel_strategy_reset_for_standby:
             print(">>> [Fuel] Strategy data reset for standby.")
+        elif reason != "standby":
+            print(f">>> [Fuel] Strategy data reset for {reason}.")
 
         self.last_lap_count = -1
         self.fuel_at_lap_start = -1
@@ -1619,7 +1683,9 @@ class RaceDashboard:
         self.fuel_strategy_has_data = False
         self.low_fuel_alerts_triggered.clear()
         self.best_lap_seen_ms = -1
-        self.fuel_strategy_reset_for_standby = True
+        self.fuel_lap_reset_candidate = None
+        self.fuel_lap_reset_count = 0
+        self.fuel_strategy_reset_for_standby = reason == "standby"
         SHARED_GAME_STATE['laps_remain'] = 0.0
         SHARED_GAME_STATE['laps_remain_ready'] = False
 
@@ -1666,7 +1732,7 @@ class RaceDashboard:
         now = time.time()
         if not self.current_packet or (now - self.last_packet_time > 2.0):
             self.status_label.config(text="● 연결 실패/대기", fg='red')
-            self.show_empty_data()
+            self.show_connection_lost_data()
             return
         
         self.status_label.config(text="● 연결됨", fg='#00ff00')
@@ -1678,7 +1744,12 @@ class RaceDashboard:
             self.last_data_val = (p.speed, p.rpm)
 
         is_moving = (now - self.last_change_time < 5.0)
-        
+
+        rank_is_standby = p.race_rank in (-1, 0xFF)
+        if p.lap_count == -1 or rank_is_standby:
+            self.show_empty_data()
+            return
+
         if on_track:
             self.mark_fuel_strategy_active()
             self.replay_label.config(text="STATUS: ON TRACK", fg='#00ff00')
@@ -1687,9 +1758,6 @@ class RaceDashboard:
             self.mark_fuel_strategy_active()
             self.replay_label.config(text="STATUS: REPLAY MODE", fg='yellow')
             self.render_dashboard(p)
-        elif p.lap_count == -1:
-            self.replay_label.config(text="STATUS: IDLE", fg='#666666')
-            self.show_empty_data()
 
         has_turbo_flag = bool(p.flags & GT7Flags.HAS_TURBO)
         is_actually_boosting = (p.boost > 1.05) # 대기압보다 높은 압력이 감지되면 터보로 간주
@@ -1771,21 +1839,35 @@ class RaceDashboard:
         if not hasattr(self, 'last_tire_temps_for_pit'): self.last_tire_temps_for_pit = p.tire_temps
         if not hasattr(self, 'pit_stopped_since'): self.pit_stopped_since = None
         if not hasattr(self, 'pit_box_announced'): self.pit_box_announced = False
-        if not hasattr(self, 'pit_entry_history'): self.pit_entry_history = []
+        if not hasattr(self, 'pit_entry_history'):
+            self.pit_entry_history = deque()
         if not hasattr(self, 'pit_entry_started_at'): self.pit_entry_started_at = None
         if not hasattr(self, 'pit_lane_started_at'): self.pit_lane_started_at = None
         
         new_status = self.pit_status
         now = time.monotonic()
         dyn_abs = abs(p.vehicle_dynamics_raw)
-        self.pit_entry_history.append((now, kmh, dyn_abs))
-        self.pit_entry_history = [
-            sample for sample in self.pit_entry_history
-            if now - sample[0] <= 1.0
-        ]
-        recent_peak_speed = max((sample[1] for sample in self.pit_entry_history), default=kmh)
         dynamics_near_zero = dyn_abs <= 0.015
-        entry_freeze_detected = recent_peak_speed > 40.0 and kmh <= 1.0 and dynamics_near_zero
+        self.pit_entry_history.append((now, kmh, dyn_abs))
+        while (
+            self.pit_entry_history
+            and now - self.pit_entry_history[0][0] > self.PIT_ENTRY_LOOKBACK_SECONDS
+        ):
+            self.pit_entry_history.popleft()
+        recent_peak_speed = max((sample[1] for sample in self.pit_entry_history), default=kmh)
+        entry_freeze_detected = (
+            recent_peak_speed > 40.0
+            and kmh <= 1.0
+            and dynamics_near_zero
+        )
+        if self.pit_status == "TRACK" and kmh <= 1.0 < self.last_speed_kmh:
+            print(
+                f">>> [PIT ENTRY CHECK] "
+                f"window={self.PIT_ENTRY_LOOKBACK_SECONDS:.2f}s, "
+                f"peak={recent_peak_speed:.1f}, speed={kmh:.1f}, "
+                f"dynamics={p.vehicle_dynamics_raw:.4f}, lap={p.lap_count}, "
+                f"detected={entry_freeze_detected and p.lap_count > 0}"
+            )
         tires_in_pit_range = all(58.5 <= t <= 60.5 for t in p.tire_temps)
         last_tires_in_pit_range = (
             self.last_tire_temps_for_pit is not None
@@ -1811,7 +1893,7 @@ class RaceDashboard:
             if entry_freeze_detected and p.lap_count > 0:
                 print(
                     f">>> [PIT ENTRY DETECTED] "
-                    f"1s peak {recent_peak_speed:.1f}->{kmh:.1f}, "
+                    f"{self.PIT_ENTRY_LOOKBACK_SECONDS:.2f}s peak {recent_peak_speed:.1f}->{kmh:.1f}, "
                     f"dynamics {self.last_vehicle_dynamics_raw:.4f}->{p.vehicle_dynamics_raw:.4f}"
                 )
                 new_status = "PIT_ENTRY"
@@ -1898,6 +1980,22 @@ class RaceDashboard:
         # -------------------------------------------------------------------------
         # 피트 작업 중이 아닐 때만(TRACK) 랩당 소모량을 계산하여 데이터 오염 방지
         if p.fuel_capacity > 0:
+            if 0 <= p.lap_count < self.last_lap_count:
+                if self.fuel_lap_reset_candidate == p.lap_count:
+                    self.fuel_lap_reset_count += 1
+                else:
+                    self.fuel_lap_reset_candidate = p.lap_count
+                    self.fuel_lap_reset_count = 1
+
+                if self.fuel_lap_reset_count >= self.FUEL_LAP_RESET_CONFIRM_PACKETS:
+                    previous_lap = self.last_lap_count
+                    self.reset_fuel_strategy(
+                        reason=f"new session (lap {previous_lap} -> {p.lap_count})"
+                    )
+                    self.display_fuel_pct = (p.fuel_level / p.fuel_capacity) * 100
+            else:
+                self.fuel_lap_reset_candidate = None
+                self.fuel_lap_reset_count = 0
             
             # 1. 초기화 로직 (게임 시작 직후 한 번만 실행)
             if self.last_lap_count == -1:
@@ -1957,8 +2055,12 @@ class RaceDashboard:
             # -------------------------------------------------
             sub_text = "CALC..."
             
-            # 데이터가 1개 이상 있고 평균값이 정상적일 때
-            if len(self.fuel_consumption_history) >= 1 and self.avg_fuel_per_lap > 0.5:
+            # 유효 판정을 통과한 연료 표본이 있으면 차량 소비량과 관계없이 계산 시작
+            if (
+                self.fuel_strategy_has_data
+                and len(self.fuel_consumption_history) >= 1
+                and self.avg_fuel_per_lap > 0.0
+            ):
                 laps_remain = p.fuel_level / self.avg_fuel_per_lap
 
                 # [봇 공유 데이터 업데이트]
@@ -2076,13 +2178,39 @@ class RaceDashboard:
         color = '#00ffff' if temp < 70 else '#00ff00' if temp < 85 else '#ffff00' if temp < 105 else '#ff0000'
         label.config(text=f"{position}\n{int(temp)}°C", fg=color)
 
+    def clear_dashboard_values(self):
+        self.speed_label.config(text="--")
+        self.gear_label.config(text="--")
+        self.fuel_label.config(text="-- L")
+        self.best_lap_label.config(text="--:--:---")
+        self.current_lap_time_label.config(text="--:--:---")
+        self.last_lap_label.config(text="--:--:---")
+        self.lap_count_label.config(text="LAP: -- / --")
+        self.pos_label.config(text="POS: -- / --", fg="white")
+        self.rpm_canvas.delete("all")
+        self.clu_canvas.delete("all")
+        self.thr_canvas.delete("all")
+        self.brk_canvas.delete("all")
+        for name, label in zip(("FL", "FR", "RL", "RR"), self.tire_labels):
+            label.config(text=f"{name}\n--°C", fg="#333")
+        self.boost_canvas.delete("all")
+        self.boost_label.config(text="BOOST: -- bar")
+        if self.has_turbo_active:
+            self.boost_frame.place_forget()
+            self.has_turbo_active = False
+        for f in [self.flag_asm, self.flag_tcs, self.flag_beam, self.flag_hand]: f.config(fg='#333')
+
+    def show_connection_lost_data(self):
+        self.replay_label.config(text="STATUS: CONNECTION LOST", fg='#ff4444')
+        self.clear_dashboard_values()
+
     def show_empty_data(self):
         self.replay_label.config(text="STATUS: STANDBY", fg='#666666')
         self.pit_status = "TRACK"
         self.pit_stopped_since = None
         self.pit_entry_started_at = None
         self.pit_lane_started_at = None
-        self.pit_entry_history = []
+        self.pit_entry_history = deque()
         self.pit_box_announced = False
         self.update_pit_sequence_display("TRACK")
         if getattr(self, 'pit_sequence_hide_after_id', None) is not None:
@@ -2093,18 +2221,8 @@ class RaceDashboard:
             self.pit_sequence_hide_after_id = None
         self.hide_pit_sequence_display()
         self.reset_fuel_strategy()
-        self.speed_label.config(text="--")
-        self.gear_label.config(text="--")
-        self.fuel_label.config(text="-- L")
-        self.best_lap_label.config(text="--:--:---")
-        self.current_lap_time_label.config(text="--:--:---")
-        self.last_lap_label.config(text="--:--:---")
-        self.rpm_canvas.delete("all")
-        self.clu_canvas.delete("all")
-        self.thr_canvas.delete("all")
-        self.brk_canvas.delete("all")
+        self.clear_dashboard_values()
         self.max_rpm_seen = 5000
-        for f in [self.flag_asm, self.flag_tcs, self.flag_beam, self.flag_hand]: f.config(fg='#333')
 
     def format_time(self, ms):
         minutes, seconds = divmod(ms // 1000, 60)
@@ -2117,26 +2235,36 @@ class RaceDashboard:
         # 간단한 팝업창으로 토큰/채널ID 입력
         win = tk.Toplevel(self.root)
         win.title("Bot Configuration")
-        win.geometry("400x200")
+        win.geometry("420x235")
         
-        config = {}
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, 'r') as f: config = json.load(f)
+        config = load_bot_config_file()
             
         tk.Label(win, text="Discord Bot Token:").pack(pady=5)
         e_token = tk.Entry(win, width=40)
-        e_token.insert(0, config.get("TOKEN", ""))
+        e_token.insert(0, str(config.get("TOKEN") or ""))
         e_token.pack()
         
         tk.Label(win, text="Voice Channel ID:").pack(pady=5)
         e_channel = tk.Entry(win, width=40)
-        e_channel.insert(0, config.get("CHANNEL_ID", ""))
+        e_channel.insert(0, str(config.get("CHANNEL_ID") or ""))
         e_channel.pack()
+
+        config_error_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=config_error_var, fg='#ff4444').pack(pady=(5, 0))
         
         def save():
-            new_cfg = {"TOKEN": e_token.get().strip(), "CHANNEL_ID": e_channel.get().strip()}
-            with open(CONFIG_PATH, 'w') as f: json.dump(new_cfg, f, indent=4)
-            win.destroy()
+            channel_id = e_channel.get().strip()
+            if channel_id and not channel_id.isdigit():
+                config_error_var.set("Voice Channel ID must contain digits only.")
+                return
+
+            new_cfg = {"TOKEN": e_token.get().strip(), "CHANNEL_ID": channel_id}
+            try:
+                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(new_cfg, f, indent=4)
+                win.destroy()
+            except OSError as e:
+                config_error_var.set(f"Could not save configuration: {e}")
             
         tk.Button(win, text="Save & Close", command=save, bg='#00ff00').pack(pady=20)
 
@@ -2147,13 +2275,9 @@ class RaceDashboard:
             return
 
         # 2. 실행 중이 아니라면 켜기
-        config = {}
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, 'r') as f: 
-                config = json.load(f)
-        self.config = config
+        self.config = load_bot_config_file()
         
-        token = self.config.get("TOKEN", "")
+        token = str(self.config.get("TOKEN") or "").strip()
         if not token:
             self.open_bot_config()
             return
