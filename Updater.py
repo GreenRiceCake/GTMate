@@ -1,456 +1,693 @@
-import json
+import argparse
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import zipfile
-import uuid
-from urllib.parse import urlparse
+from pathlib import Path
+from typing import Callable, Optional
 
-import requests
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-CURR_VER_FILE = os.path.join(BASE_DIR, "curr_ver.json")
-TARGET_PROGRAM = "GTMate.exe"
-UPDATE_INFO_URL = os.environ.get(
-    "GTMATE_UPDATE_INFO_URL",
-    "https://raw.githubusercontent.com/GreenRiceCake/GTMate/main/update_manifest.json",
+from updater_core.manifest import (
+    DEFAULT_UPDATE_INFO_URL,
+    UPDATER_PROTOCOL_VERSION,
+    UpdateInfo,
+    fetch_update_info,
+    is_newer_version,
+    load_current_version,
 )
-PENDING_SELF_UPDATE = None
+from updater_core.package import (
+    download_file,
+    find_update_root,
+    load_or_build_package_manifest,
+    safe_extract_zip,
+    verify_download,
+    verify_payload,
+)
+from updater_core.paths import (
+    CURRENT_VERSION_FILE,
+    INSTALLED_MANIFEST_FILE,
+    TARGET_PROGRAM,
+    atomic_write_json,
+    runtime_base_dir,
+    updater_state_root,
+    validate_install_directory,
+)
+from updater_core.transaction import (
+    cleanup_finalized_transactions,
+    cleanup_transaction_payload,
+    create_transaction_journal,
+    create_transaction_workspace,
+    find_incomplete_transactions,
+    load_transaction,
+    rollback_transaction,
+    apply_transaction,
+)
+from updater_core.windows import (
+    IS_WINDOWS,
+    is_admin,
+    launch_apply_worker,
+    launch_uninstall_worker,
+    launch_worker,
+    perform_uninstall,
+    repair_install_registration,
+    start_gtmate,
+    terminate_program,
+    update_install_registration,
+    wait_for_process_exit,
+)
 
 
-def load_current_version():
-    try:
-        with open(CURR_VER_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("version", "0.0.0")
-    except FileNotFoundError:
-        return "0.0.0"
-    except Exception:
-        return "0.0.0"
+BASE_DIR = runtime_base_dir()
+UPDATE_INFO_URL = os.environ.get("GTMATE_UPDATE_INFO_URL", DEFAULT_UPDATE_INFO_URL)
 
 
-def parse_version(version_text):
-    parts = []
-    for part in str(version_text).split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        parts.append(int(digits or 0))
+class ProgressWindow:
+    def __init__(self, title: str, close_locked: bool = True):
+        self.root = tk.Tk()
+        self.root.title(title)
+        self.root.geometry("560x410")
+        self.root.resizable(False, False)
+        self.close_locked = close_locked
+        self.finished = False
+        self.install_dir: Optional[Path] = None
+        self._last_logged_message = ""
 
-    while len(parts) < 3:
-        parts.append(0)
-
-    return tuple(parts[:3])
-
-
-def get_update_info():
-    response = requests.get(UPDATE_INFO_URL, timeout=15)
-    response.raise_for_status()
-    return response.json()
-
-
-def kill_program(process_name):
-    try:
-        subprocess.run(
-            ["taskkill", "/f", "/im", process_name],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    except subprocess.CalledProcessError:
-        pass
-
-
-def download_file(url, destination, progress=None):
-    with requests.get(url, stream=True, timeout=30) as response:
-        response.raise_for_status()
-        total_size = int(response.headers.get("content-length", 0))
-        downloaded = 0
-
-        with open(destination, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress and total_size:
-                        progress(downloaded, total_size)
-
-
-def find_update_root(extract_dir):
-    entries = [
-        os.path.join(extract_dir, name)
-        for name in os.listdir(extract_dir)
-        if not name.startswith("__MACOSX")
-    ]
-
-    if len(entries) == 1 and os.path.isdir(entries[0]):
-        nested_exe = os.path.join(entries[0], TARGET_PROGRAM)
-        if os.path.exists(nested_exe):
-            return entries[0]
-
-    return extract_dir
-
-
-def should_skip_path(relative_path):
-    normalized = relative_path.replace("\\", "/").lower()
-    preserved_files = {
-        "bot_config.json",
-    }
-
-    return normalized in preserved_files
-
-
-def write_current_version(new_version):
-    with open(CURR_VER_FILE, "w", encoding="utf-8") as f:
-        json.dump({"version": new_version}, f, indent=4)
-
-
-def run_installer(installer_path):
-    subprocess.Popen([installer_path], cwd=os.path.dirname(installer_path))
-
-
-def update_from_exe(download_url, new_version, ui=None):
-    if ui:
-        ui.set_step("GTMate 종료 중...")
-    kill_program(TARGET_PROGRAM)
-
-    temp_dir = tempfile.mkdtemp(prefix="gtmate_update_")
-    try:
-        exe_path = os.path.join(temp_dir, TARGET_PROGRAM)
-        if ui:
-            ui.set_step("새 실행 파일 다운로드 중...")
-        download_file(download_url, exe_path, ui.set_download_progress if ui else None)
-
-        if ui:
-            ui.set_step("실행 파일 교체 중...")
-        shutil.copy2(exe_path, os.path.join(BASE_DIR, TARGET_PROGRAM))
-
-        if ui:
-            ui.set_step("버전 정보 갱신 중...")
-        write_current_version(new_version)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def update_from_zip(download_url, new_version, ui=None):
-    if ui:
-        ui.set_step("GTMate 종료 중...")
-    kill_program(TARGET_PROGRAM)
-    time.sleep(0.5)
-
-    temp_dir = tempfile.mkdtemp(prefix="gtmate_update_")
-    try:
-        zip_path = os.path.join(temp_dir, "update.zip")
-        extract_dir = os.path.join(temp_dir, "extract")
-
-        if ui:
-            ui.set_step("업데이트 파일 다운로드 중...")
-        download_file(download_url, zip_path, ui.set_download_progress if ui else None)
-
-        if ui:
-            ui.set_step("압축 해제 중...")
-        os.makedirs(extract_dir, exist_ok=True)
-
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            members = zf.infolist()
-            total_members = max(len(members), 1)
-            for index, member in enumerate(members, start=1):
-                zf.extract(member, extract_dir)
-                if ui:
-                    ui.set_file_progress(index, total_members, f"압축 해제: {member.filename}")
-
-        update_root = find_update_root(extract_dir)
-        if not os.path.exists(os.path.join(update_root, TARGET_PROGRAM)):
-            raise RuntimeError("업데이트 zip 안에서 GTMate.exe를 찾을 수 없습니다.")
-
-        if ui:
-            ui.set_step("파일 교체 중...")
-        copy_update_tree(update_root, BASE_DIR, ui)
-
-        if ui:
-            ui.set_step("버전 정보 갱신 중...")
-        write_current_version(new_version)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def update_from_installer(download_url, ui=None):
-    temp_dir = tempfile.mkdtemp(prefix="gtmate_installer_")
-    parsed = urlparse(download_url)
-    file_name = os.path.basename(parsed.path) or "GTMate_Installer.exe"
-    if not file_name.lower().endswith(".exe"):
-        file_name = "GTMate_Installer.exe"
-
-    installer_path = os.path.join(temp_dir, file_name)
-    if ui:
-        ui.set_step("설치 파일 다운로드 중...")
-    download_file(download_url, installer_path, ui.set_download_progress if ui else None)
-
-    if ui:
-        ui.set_step("설치 파일 실행 중...")
-    run_installer(installer_path)
-
-
-def collect_copy_jobs(source_dir, target_dir):
-    jobs = []
-    for root, dirs, files in os.walk(source_dir):
-        relative_root = os.path.relpath(root, source_dir)
-        if relative_root == ".":
-            relative_root = ""
-
-        for file_name in files:
-            relative_path = os.path.normpath(os.path.join(relative_root, file_name))
-            if should_skip_path(relative_path):
-                continue
-
-            source_path = os.path.join(root, file_name)
-            target_path = os.path.join(target_dir, relative_path)
-            jobs.append((source_path, target_path, relative_path))
-
-    return jobs
-
-
-def copy_update_tree(source_dir, target_dir, ui=None):
-    global PENDING_SELF_UPDATE
-
-    jobs = collect_copy_jobs(source_dir, target_dir)
-    total_jobs = max(len(jobs), 1)
-
-    for index, (source_path, target_path, relative_path) in enumerate(jobs, start=1):
-        if relative_path.replace("\\", "/").lower() == "updater.exe":
-            staged_path = os.path.join(target_dir, "Updater.new.exe")
-            shutil.copy2(source_path, staged_path)
-            PENDING_SELF_UPDATE = staged_path
-            if ui:
-                ui.set_file_progress(index, total_jobs, "Updater.exe는 종료 후 교체하도록 예약됨")
-            continue
-
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        shutil.copy2(source_path, target_path)
-        if ui:
-            ui.set_file_progress(index, total_jobs, f"파일 교체: {relative_path}")
-
-
-def schedule_self_update():
-    if not PENDING_SELF_UPDATE:
-        return
-
-    updater_path = os.path.join(BASE_DIR, "Updater.exe")
-    script_path = os.path.join(BASE_DIR, f"gtmate_updater_finish_{uuid.uuid4().hex}.cmd")
-    commands = [
-        "@echo off",
-        "timeout /t 1 /nobreak >nul",
-        "for /l %%i in (1,1,30) do (",
-        f'    if not exist "{PENDING_SELF_UPDATE}" goto move_done',
-        f'    move /y "{PENDING_SELF_UPDATE}" "{updater_path}" >nul 2>nul',
-        f'    if not exist "{PENDING_SELF_UPDATE}" goto move_done',
-        "    timeout /t 1 /nobreak >nul",
-        ")",
-        ":move_done",
-        'del "%~f0" >nul 2>nul',
-    ]
-
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write("\r\n".join(commands))
-
-    subprocess.Popen(
-        ["cmd", "/c", script_path],
-        cwd=BASE_DIR,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-
-
-class UpdateUI:
-    def __init__(self, root, update_info):
-        self.root = root
-        self.update_info = update_info
-        self.completed = False
-
-        self.status_var = tk.StringVar(value="업데이트 준비 중...")
+        self.status_var = tk.StringVar(value="준비 중...")
         self.download_var = tk.StringVar(value="")
         self.file_var = tk.StringVar(value="")
 
-        self.window = tk.Toplevel(root)
-        self.window.title("GTMate 업데이트 진행")
-        self.window.geometry("500x360")
-        self.window.resizable(False, False)
-        self.window.protocol("WM_DELETE_WINDOW", lambda: None)
+        tk.Label(self.root, text=title, font=("Arial", 15, "bold")).pack(
+            pady=(14, 4)
+        )
+        tk.Label(self.root, textvariable=self.status_var, font=("Arial", 10)).pack(
+            pady=(0, 8)
+        )
 
-        tk.Label(self.window, text="업데이트 진행 중", font=("Arial", 14, "bold")).pack(pady=(14, 4))
-        tk.Label(self.window, textvariable=self.status_var, font=("Arial", 11)).pack(pady=(0, 8))
-
-        self.download_bar = ttk.Progressbar(self.window, length=430, mode="determinate")
+        self.download_bar = ttk.Progressbar(self.root, length=480, mode="determinate")
         self.download_bar.pack(pady=(2, 2))
-        tk.Label(self.window, textvariable=self.download_var, font=("Arial", 9)).pack()
+        tk.Label(self.root, textvariable=self.download_var, font=("Arial", 9)).pack()
 
-        self.file_bar = ttk.Progressbar(self.window, length=430, mode="determinate")
+        self.file_bar = ttk.Progressbar(self.root, length=480, mode="determinate")
         self.file_bar.pack(pady=(10, 2))
-        tk.Label(self.window, textvariable=self.file_var, font=("Arial", 9)).pack()
+        tk.Label(self.root, textvariable=self.file_var, font=("Arial", 9)).pack()
 
-        self.log_text = tk.Text(self.window, height=9, width=58)
+        self.log_text = tk.Text(self.root, height=11, width=67)
         self.log_text.config(state=tk.DISABLED)
         self.log_text.pack(pady=(10, 8))
 
-        self.close_button = tk.Button(self.window, text="Close", state=tk.DISABLED, command=self.close)
-        self.close_button.pack()
+        self.button_frame = tk.Frame(self.root)
+        self.button_frame.pack(pady=(0, 8))
+        self.restart_button = tk.Button(
+            self.button_frame,
+            text="GTMate 다시 실행",
+            state=tk.DISABLED,
+            command=self.restart_gtmate,
+        )
+        self.restart_button.grid(row=0, column=0, padx=6)
+        self.close_button = tk.Button(
+            self.button_frame,
+            text="닫기",
+            state=tk.DISABLED if close_locked else tk.NORMAL,
+            command=self.root.destroy,
+        )
+        self.close_button.grid(row=0, column=1, padx=6)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def run_on_ui(self, callback):
-        self.window.after(0, callback)
+    def _on_close(self):
+        if self.close_locked and not self.finished:
+            return
+        self.root.destroy()
 
-    def log(self, message):
+    def on_ui(self, callback: Callable[[], None]) -> None:
+        self.root.after(0, callback)
+
+    def log(self, message: str) -> None:
+        message = str(message)
+
         def update():
             self.log_text.config(state=tk.NORMAL)
             self.log_text.insert(tk.END, message + "\n")
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
 
-        self.run_on_ui(update)
+        self.on_ui(update)
 
-    def set_step(self, message):
-        self.run_on_ui(lambda: self.status_var.set(message))
-        self.log(message)
-
-    def set_download_progress(self, current, total):
-        percent = int(current * 100 / total) if total else 0
-
-        def update():
-            self.download_bar["value"] = percent
-            self.download_var.set(f"다운로드: {percent}% ({current // 1024 // 1024}MB / {total // 1024 // 1024}MB)")
-
-        self.run_on_ui(update)
-
-    def set_file_progress(self, current, total, message):
-        percent = int(current * 100 / total) if total else 0
-
-        def update():
-            self.file_bar["value"] = percent
-            self.file_var.set(f"{current} / {total}")
-
-        self.run_on_ui(update)
-        if current == 1 or current == total or current % 20 == 0:
+    def set_status(self, message: str, log: bool = True) -> None:
+        self.on_ui(lambda: self.status_var.set(message))
+        if log and message != self._last_logged_message:
+            self._last_logged_message = message
             self.log(message)
 
-    def complete(self, message):
+    def progress(self, current: int, total: int, message: str) -> None:
+        percent = int(current * 100 / total) if total else 0
+        percent = max(0, min(percent, 100))
+        is_download = message.startswith("업데이트 파일 다운로드")
+
         def update():
-            self.completed = True
+            self.status_var.set(message)
+            if is_download:
+                self.download_bar["value"] = percent
+                if total:
+                    self.download_var.set(
+                        f"다운로드 {percent}% "
+                        f"({current // 1024 // 1024}MB / {total // 1024 // 1024}MB)"
+                    )
+                else:
+                    self.download_var.set(f"다운로드 {current // 1024 // 1024}MB")
+            else:
+                self.file_bar["value"] = percent
+                self.file_var.set(f"{percent}% ({current} / {total})")
+
+        self.on_ui(update)
+        if current in {1, total} or (current and current % 50 == 0):
+            self.log(message)
+
+    def complete(self, message: str, install_dir: Optional[Path] = None) -> None:
+        self.install_dir = install_dir
+
+        def update():
+            self.finished = True
             self.status_var.set(message)
             self.download_bar["value"] = 100
             self.file_bar["value"] = 100
             self.close_button.config(state=tk.NORMAL)
+            if install_dir and (install_dir / TARGET_PROGRAM).is_file():
+                self.restart_button.config(state=tk.NORMAL)
 
-        self.run_on_ui(update)
+        self.on_ui(update)
         self.log(message)
-        if PENDING_SELF_UPDATE:
-            self.log("Updater.exe는 창을 닫은 뒤 자동으로 교체됩니다.")
 
-    def fail(self, error):
+    def fail(self, error: Exception | str) -> None:
+        message = str(error)
+
         def update():
-            self.status_var.set("업데이트 실패")
+            self.finished = True
+            self.status_var.set("작업 실패")
             self.close_button.config(state=tk.NORMAL)
-            messagebox.showerror("업데이트 실패", f"업데이트 중 오류가 발생했습니다:\n{error}")
+            messagebox.showerror("GTMate Updater", message, parent=self.root)
 
-        self.run_on_ui(update)
-        self.log(f"오류: {error}")
+        self.on_ui(update)
+        self.log(f"오류: {message}")
 
-    def close(self):
-        self.window.destroy()
-        if self.completed:
-            schedule_self_update()
-            sys.exit()
+    def restart_gtmate(self) -> None:
+        if self.install_dir:
+            start_gtmate(self.install_dir)
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
 
 
-def update_program(update_info, parent):
-    ui = UpdateUI(parent, update_info)
+def show_update_prompt(info: UpdateInfo, current_version: str, repair: bool = False) -> bool:
+    root = tk.Tk()
+    root.title("GTMate 복구" if repair else "GTMate 업데이트")
+    root.geometry("500x405")
+    root.resizable(False, False)
+    accepted = {"value": False}
+
+    heading = "현재 버전을 다시 설치합니다" if repair else (
+        f"업데이트 확인: {current_version} -> {info.version}"
+    )
+    tk.Label(root, text=heading, font=("Arial", 14, "bold")).pack(pady=(14, 8))
+    tk.Label(root, text=info.title, font=("Arial", 11, "bold")).pack()
+
+    changelog = tk.Text(root, height=15, width=58, wrap=tk.WORD)
+    changelog.insert(tk.END, info.changelog or "변경 내역이 없습니다.")
+    changelog.config(state=tk.DISABLED)
+    changelog.pack(padx=12, pady=10)
+
+    button_frame = tk.Frame(root)
+    button_frame.pack(pady=5)
+
+    def accept():
+        accepted["value"] = True
+        root.destroy()
+
+    tk.Button(
+        button_frame,
+        text="복구" if repair else "업데이트",
+        width=12,
+        command=accept,
+    ).grid(row=0, column=0, padx=8)
+    tk.Button(button_frame, text="취소", width=12, command=root.destroy).grid(
+        row=0, column=1, padx=8
+    )
+    root.mainloop()
+    return accepted["value"]
+
+
+def _prepare_zip_update(info: UpdateInfo, ui: ProgressWindow) -> None:
+    workspace = create_transaction_workspace()
+    archive_path = workspace["download_dir"] / "update.zip"
+    apply_worker_started = False
+    try:
+        ui.set_status("업데이트 파일 다운로드 중")
+        download_file(
+            info.package.url,
+            archive_path,
+            expected_size=info.package.size,
+            progress=ui.progress,
+        )
+        ui.set_status("다운로드 파일 검증 중")
+        actual_sha256 = verify_download(
+            archive_path,
+            info.package.sha256,
+            info.package.size,
+            progress=ui.progress,
+        )
+        if not info.package.sha256:
+            ui.log(f"참고: 원격 SHA-256 미지정, 계산값={actual_sha256}")
+
+        ui.set_status("압축 해제 중")
+        safe_extract_zip(archive_path, workspace["extract_dir"], progress=ui.progress)
+        update_root = find_update_root(workspace["extract_dir"])
+
+        ui.set_status("패키지 파일 검증 중")
+        manifest, manifest_path, generated = load_or_build_package_manifest(
+            update_root,
+            info.version,
+            manifest_name=info.package.package_manifest,
+            transactional=info.package.transactional,
+            progress=ui.progress,
+        )
+        if generated:
+            ui.log("레거시 ZIP에서 임시 파일 매니페스트를 생성했습니다.")
+        else:
+            ui.log(f"파일 매니페스트 로드: {manifest_path.name}")
+        verify_payload(update_root, manifest, progress=ui.progress)
+
+        journal_path = create_transaction_journal(
+            workspace,
+            BASE_DIR,
+            update_root,
+            manifest,
+            load_current_version(BASE_DIR),
+            info.version,
+        )
+        ui.log(f"Transaction 준비 완료: {journal_path}")
+        ui.set_status("관리자 권한으로 파일 교체 준비 중")
+        launch_apply_worker(journal_path, elevated=IS_WINDOWS)
+        apply_worker_started = True
+        ui.on_ui(ui.root.destroy)
+    finally:
+        if not apply_worker_started:
+            shutil.rmtree(workspace["transaction_dir"], ignore_errors=True)
+
+
+def _prepare_installer_update(info: UpdateInfo, ui: ProgressWindow) -> None:
+    workspace = create_transaction_workspace()
+    installer_path = workspace["download_dir"] / "GTMate_Installer.exe"
+    download_file(
+        info.package.url,
+        installer_path,
+        expected_size=info.package.size,
+        progress=ui.progress,
+    )
+    verify_download(
+        installer_path,
+        info.package.sha256,
+        info.package.size,
+        progress=ui.progress,
+    )
+    terminate_program(TARGET_PROGRAM)
+    subprocess.Popen([str(installer_path)], cwd=str(installer_path.parent))
+    ui.complete("설치 프로그램을 실행했습니다.")
+
+
+def _prepare_exe_update(info: UpdateInfo, ui: ProgressWindow) -> None:
+    workspace = create_transaction_workspace()
+    downloaded = workspace["download_dir"] / TARGET_PROGRAM
+    download_file(
+        info.package.url,
+        downloaded,
+        expected_size=info.package.size,
+        progress=ui.progress,
+    )
+    verify_download(
+        downloaded,
+        info.package.sha256,
+        info.package.size,
+        progress=ui.progress,
+    )
+    terminate_program(TARGET_PROGRAM)
+    target = BASE_DIR / TARGET_PROGRAM
+    backup = workspace["backup_dir"] / TARGET_PROGRAM
+    if target.is_file():
+        shutil.copy2(target, backup)
+    temporary = target.with_name(target.name + ".new")
+    try:
+        shutil.copy2(downloaded, temporary)
+        os.replace(temporary, target)
+        atomic_write_json(BASE_DIR / CURRENT_VERSION_FILE, {"version": info.version})
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        if backup.is_file():
+            shutil.copy2(backup, target)
+        raise
+    ui.complete(f"v{info.version} 실행 파일 업데이트 완료", BASE_DIR)
+
+
+def run_prepare_update(info: UpdateInfo) -> None:
+    ui = ProgressWindow("GTMate 업데이트 진행")
 
     def worker():
         try:
-            new_version = update_info["version"]
-            download_url = update_info["download_url"]
-            update_type = update_info.get("update_type", "exe").lower()
-
-            ui.log(f"업데이트 방식: {update_type}")
-
-            if update_type == "zip":
-                update_from_zip(download_url, new_version, ui)
-                ui.complete(f"v{new_version} 업데이트 완료. 다시 실행해주세요.")
-                return
-
-            if update_type == "installer":
-                ui.set_step("GTMate 종료 중...")
-                kill_program(TARGET_PROGRAM)
-                update_from_installer(download_url, ui)
-                ui.complete("설치 파일을 실행했습니다. 설치 마법사를 따라 진행해주세요.")
-                return
-
-            if update_type == "exe":
-                update_from_exe(download_url, new_version, ui)
-                ui.complete(f"v{new_version} 업데이트 완료. 다시 실행해주세요.")
-                return
-
-            raise RuntimeError(f"지원하지 않는 업데이트 방식입니다: {update_type}")
-
-        except Exception as e:
-            ui.fail(e)
+            ui.log(f"업데이트 형식: {info.package.package_type}")
+            ui.log(f"Transactional package: {info.package.transactional}")
+            if info.package.package_type == "zip":
+                _prepare_zip_update(info, ui)
+            elif info.package.package_type == "installer":
+                _prepare_installer_update(info, ui)
+            else:
+                _prepare_exe_update(info, ui)
+        except Exception as error:
+            ui.fail(error)
 
     threading.Thread(target=worker, daemon=True).start()
+    ui.run()
 
 
-def main():
-    try:
-        current_version = load_current_version()
-        data = get_update_info()
-    except Exception as e:
-        messagebox.showerror("업데이트 확인 실패", f"업데이트 정보를 가져올 수 없습니다:\n{e}")
-        return
+def _launch_recovery_worker(journal_path: Path) -> None:
+    host_dir = journal_path.parent / "recovery-host"
+    launch_worker(
+        ["--rollback", str(journal_path), "--parent-pid", str(os.getpid())],
+        host_dir,
+        elevated=IS_WINDOWS,
+    )
 
-    latest_version = data.get("version", "0.0.0")
-    changelog = data.get("changelog", "")
-    title = data.get("title", "GTMate 업데이트")
 
-    if parse_version(latest_version) <= parse_version(current_version):
-        messagebox.showinfo("GTMate", f"현재 최신 버전(v{current_version})을 사용 중입니다.")
-        return
-
+def handle_incomplete_transaction() -> bool:
+    incomplete = find_incomplete_transactions()
+    if not incomplete:
+        return False
+    journal_path = incomplete[0]
+    journal = load_transaction(journal_path)
     root = tk.Tk()
-    root.title("GTMate 업데이트")
-    root.geometry("440x360")
+    root.withdraw()
+    should_restore = messagebox.askyesno(
+        "중단된 업데이트 발견",
+        "완료되지 않은 GTMate 업데이트가 있습니다.\n\n"
+        f"대상 버전: {journal.get('to_version')}\n"
+        f"상태: {journal.get('state')}\n\n"
+        "이전 버전으로 복구하시겠습니까?",
+        parent=root,
+    )
+    root.destroy()
+    if should_restore:
+        _launch_recovery_worker(journal_path)
+    return True
 
-    label = tk.Label(root, text=f"업데이트 확인: {current_version} -> {latest_version}", font=("Arial", 14))
-    label.pack(pady=10)
 
-    title_label = tk.Label(root, text=title, font=("Arial", 11, "bold"))
-    title_label.pack()
+def run_normal_mode(repair: bool = False) -> None:
+    cleanup_finalized_transactions()
+    if handle_incomplete_transaction():
+        return
+    try:
+        current_version = load_current_version(BASE_DIR)
+        info = fetch_update_info(UPDATE_INFO_URL)
+    except Exception as error:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "업데이트 확인 실패",
+            f"업데이트 정보를 가져올 수 없습니다:\n{error}",
+            parent=root,
+        )
+        root.destroy()
+        return
 
-    changelog_text = tk.Text(root, height=13, width=52)
-    changelog_text.insert(tk.END, changelog)
-    changelog_text.config(state=tk.DISABLED)
-    changelog_text.pack(pady=8)
+    if not repair and not is_newer_version(info.version, current_version):
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "GTMate",
+            f"현재 최신 버전(v{current_version})을 사용 중입니다.",
+            parent=root,
+        )
+        root.destroy()
+        return
+    if not show_update_prompt(info, current_version, repair=repair):
+        return
+    run_prepare_update(info)
 
-    frame = tk.Frame(root)
-    frame.pack(pady=10)
 
-    def start_update():
-        update_button.config(state=tk.DISABLED)
-        ignore_button.config(state=tk.DISABLED)
-        update_program(data, root)
+def run_apply_mode(journal_path: Path, parent_pid: int) -> None:
+    ui = ProgressWindow("GTMate 업데이트 적용")
 
-    update_button = tk.Button(frame, text="Update", command=start_update)
-    update_button.grid(row=0, column=0, padx=10)
+    def worker():
+        try:
+            ui.set_status("기존 Updater 종료 대기 중")
+            if parent_pid and not wait_for_process_exit(parent_pid, timeout=45):
+                raise RuntimeError("기존 Updater가 종료되지 않았습니다.")
+            ui.set_status("GTMate 종료 중")
+            terminate_program(TARGET_PROGRAM)
 
-    ignore_button = tk.Button(frame, text="Ignore", command=root.destroy)
-    ignore_button.grid(row=0, column=1, padx=10)
+            def registration_callback(path: Path, version: str):
+                if not update_install_registration(path, version, create_if_missing=False):
+                    raise RuntimeError("기존 제어판 등록 정보를 찾지 못했습니다.")
 
-    root.mainloop()
+            result = apply_transaction(
+                journal_path,
+                progress=ui.progress,
+                registration_callback=registration_callback,
+            )
+            if result.get("registration_updated") is False:
+                ui.log(
+                    "제어판 정보 갱신은 보류되었습니다: "
+                    + str(result.get("registration_error") or "unknown")
+                )
+            try:
+                cleanup_transaction_payload(journal_path)
+                ui.log("업데이트 임시 파일 정리 완료")
+            except Exception as cleanup_error:
+                ui.log(f"업데이트 임시 파일 정리 보류: {cleanup_error}")
+            ui.complete(
+                f"v{result['to_version']} 업데이트 완료",
+                Path(result["install_dir"]),
+            )
+        except Exception as error:
+            ui.fail(error)
+
+    threading.Thread(target=worker, daemon=True).start()
+    ui.run()
+
+
+def run_rollback_mode(journal_path: Path, parent_pid: int) -> None:
+    ui = ProgressWindow("GTMate 업데이트 복구")
+
+    def worker():
+        try:
+            if parent_pid and not wait_for_process_exit(parent_pid, timeout=45):
+                raise RuntimeError("기존 Updater가 종료되지 않았습니다.")
+            terminate_program(TARGET_PROGRAM)
+            result = rollback_transaction(journal_path, progress=ui.progress)
+            install_dir = Path(result["install_dir"])
+            version = load_current_version(install_dir)
+            try:
+                update_install_registration(install_dir, version, create_if_missing=False)
+            except Exception as registration_error:
+                ui.log(f"제어판 정보 복구 보류: {registration_error}")
+            try:
+                cleanup_transaction_payload(journal_path)
+                ui.log("복구 임시 파일 정리 완료")
+            except Exception as cleanup_error:
+                ui.log(f"복구 임시 파일 정리 보류: {cleanup_error}")
+            ui.complete("이전 버전 복구 완료", install_dir)
+        except Exception as error:
+            ui.fail(error)
+
+    threading.Thread(target=worker, daemon=True).start()
+    ui.run()
+
+
+def run_registration_mode(install_dir: Path, version: str, quiet: bool) -> None:
+    install_dir = install_dir.resolve()
+    if IS_WINDOWS and not is_admin():
+        host_dir = updater_state_root() / "registration" / str(int(time.time()))
+        arguments = [
+            "--repair-registration",
+            "--install-dir",
+            str(install_dir),
+            "--version",
+            version,
+            "--quiet",
+        ]
+        try:
+            launch_worker(arguments, host_dir, elevated=True)
+        except Exception:
+            if not quiet:
+                raise
+        return
+    try:
+        repair_install_registration(install_dir, version)
+        if not quiet:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo("GTMate", "제어판 설치 정보를 복구했습니다.", parent=root)
+            root.destroy()
+    except Exception as error:
+        if quiet:
+            error_path = updater_state_root() / "registration_error.json"
+            atomic_write_json(
+                error_path,
+                {
+                    "install_dir": str(install_dir),
+                    "version": str(version),
+                    "error": str(error),
+                },
+            )
+            return
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("GTMate", f"설치 정보 복구 실패:\n{error}", parent=root)
+        root.destroy()
+
+
+def run_uninstall_mode(install_dir: Path, quiet: bool) -> None:
+    remove_user_data = False
+    if not quiet:
+        root = tk.Tk()
+        root.title("GTMate 제거")
+        root.geometry("430x220")
+        root.resizable(False, False)
+        confirmed = {"value": False}
+        selection = {"remove_user_data": False}
+        remove_var = tk.BooleanVar(value=False)
+        tk.Label(root, text="GTMate를 제거하시겠습니까?", font=("Arial", 14, "bold")).pack(
+            pady=(22, 10)
+        )
+        tk.Label(root, text=f"제거 경로: {install_dir}", wraplength=390).pack(pady=4)
+        tk.Checkbutton(
+            root,
+            text="AppData에 저장된 사용자 설정과 스킨도 제거",
+            variable=remove_var,
+        ).pack(pady=12)
+
+        buttons = tk.Frame(root)
+        buttons.pack()
+
+        def confirm():
+            confirmed["value"] = True
+            selection["remove_user_data"] = bool(remove_var.get())
+            root.destroy()
+
+        tk.Button(buttons, text="제거", width=12, command=confirm).grid(
+            row=0, column=0, padx=8
+        )
+        tk.Button(buttons, text="취소", width=12, command=root.destroy).grid(
+            row=0, column=1, padx=8
+        )
+        root.mainloop()
+        if not confirmed["value"]:
+            return
+        remove_user_data = selection["remove_user_data"]
+
+    launch_uninstall_worker(
+        install_dir,
+        remove_user_data=remove_user_data,
+        elevated=IS_WINDOWS,
+    )
+
+
+def run_uninstall_worker(
+    install_dir: Path,
+    parent_pid: int,
+    remove_user_data: bool,
+    quiet: bool,
+) -> None:
+    if quiet:
+        try:
+            if parent_pid and not wait_for_process_exit(parent_pid, timeout=45):
+                raise RuntimeError("기존 Updater가 종료되지 않았습니다.")
+            perform_uninstall(install_dir, remove_user_data=remove_user_data)
+        except Exception as error:
+            atomic_write_json(
+                updater_state_root() / "uninstall_error.json",
+                {
+                    "install_dir": str(install_dir),
+                    "remove_user_data": bool(remove_user_data),
+                    "error": str(error),
+                },
+            )
+        return
+
+    ui = ProgressWindow("GTMate 제거")
+
+    def worker():
+        try:
+            if parent_pid and not wait_for_process_exit(parent_pid, timeout=45):
+                raise RuntimeError("기존 Updater가 종료되지 않았습니다.")
+            perform_uninstall(
+                install_dir,
+                remove_user_data=remove_user_data,
+                progress=ui.progress,
+            )
+            ui.complete("GTMate 제거 완료")
+        except Exception as error:
+            ui.fail(error)
+
+    threading.Thread(target=worker, daemon=True).start()
+    ui.run()
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--apply", type=Path)
+    parser.add_argument("--rollback", type=Path)
+    parser.add_argument("--parent-pid", type=int, default=0)
+    parser.add_argument("--repair", action="store_true")
+    parser.add_argument("--repair-registration", action="store_true")
+    parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--uninstall-worker", type=Path)
+    parser.add_argument("--install-dir", type=Path)
+    parser.add_argument("--version", default="")
+    parser.add_argument("--remove-user-data", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--self-test", type=Path, help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def main() -> None:
+    arguments = parse_arguments()
+    if arguments.self_test:
+        atomic_write_json(
+            arguments.self_test.resolve(),
+            {
+                "ok": True,
+                "updater_protocol": UPDATER_PROTOCOL_VERSION,
+                "base_dir": str(BASE_DIR),
+                "frozen": bool(getattr(sys, "frozen", False)),
+            },
+        )
+        return
+    if arguments.apply:
+        run_apply_mode(arguments.apply, arguments.parent_pid)
+        return
+    if arguments.rollback:
+        run_rollback_mode(arguments.rollback, arguments.parent_pid)
+        return
+    if arguments.uninstall_worker:
+        run_uninstall_worker(
+            arguments.uninstall_worker,
+            arguments.parent_pid,
+            arguments.remove_user_data,
+            arguments.quiet,
+        )
+        return
+
+    install_dir = (arguments.install_dir or BASE_DIR).resolve()
+    if arguments.repair_registration:
+        version = arguments.version or load_current_version(install_dir)
+        run_registration_mode(install_dir, version, arguments.quiet)
+        return
+    if arguments.uninstall:
+        run_uninstall_mode(install_dir, arguments.quiet)
+        return
+    run_normal_mode(repair=arguments.repair)
 
 
 if __name__ == "__main__":

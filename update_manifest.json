@@ -1,7 +1,15 @@
 {
-    "version": "1.1.1",
-    "title": "GTMate v1.1.1 업데이트",
-    "changelog": "- 피트 감지 방식을 개선해, 피트 진입 장면도 안정적으로 인식하면서 사고로 인한 오인식을 줄였습니다.\n- 랩 또는 순위 정보가 아직 없는 레이스 대기 화면을 STANDBY 상태로 정확히 인식하고, 새 주행을 시작할 때 피트 및 연료 계산 데이터를 깨끗하게 초기화하도록 개선했습니다.\n- PlayStation 텔레메트리 수신이 중단되면 2초 안에 연결 실패 상태로 전환하며, 일시적인 끊김에는 연료 계산과 피트 상태를 보존하도록 개선했습니다.\n- 랩당 연료 소모량이 0.5L 이하인 차량과 짧은 코스에서도 유효 표본을 얻으면 남은 랩 계산을 시작하도록 개선했습니다.\n- 프로그램 창을 먼저 표시한 뒤 백그라운드에서 조용히 업데이트를 확인하도록 시작 과정을 개선했습니다.\n- Discord 설정 파일이 손상되거나 채널 ID가 잘못된 경우에도 안전하게 설정 화면을 열고 사용 가능한 음성 채널을 찾도록 개선했습니다.",
+    "version": "1.2.0",
+    "title": "GTMate v1.2.0 업데이트",
+    "changelog": "- 설정 화면을 탭 방식으로 개편했습니다.\n- 디스코드 봇과 PC 입출력 장치를 사용하는 네이티브 팀 라디오 모드를 선택할 수 있게 했습니다.\n- 네이티브 오디오의 마이크와 출력 장치 선택 및 시스템 기본 장치 표시를 추가했습니다.\n- 레이스 중이 아닐 때 순위와 랩 질문에 대한 안내를 추가했습니다.\n- 랩 경계를 기준으로 타이어 온도를 판단하고 차가운 타이어와 과열된 타이어를 위치별로 알려주는 기능을 추가했습니다.\n- 피트 박스와 피트 아웃 안내를 모든 라디오 모드의 공통 엔지니어 발화 경로로 통합했습니다.\n- 업데이트 파일의 해시 검증, 트랜잭션 적용, 실패 시 롤백과 복구 기능을 추가했습니다.\n- 업데이트 후 제어판 버전 정보 갱신과 완전한 프로그램 제거를 지원하도록 업데이터를 개선했습니다.",
     "update_type": "zip",
-    "download_url": "https://www.dropbox.com/scl/fi/m8qdbzj1i4a07rhzo3cpe/GTMate_v1.1.1.zip?rlkey=bmu9y16amtpcwxb5lwggt6d6l&st=npbziu7n&dl=1"
+    "download_url": "https://www.dropbox.com/scl/fi/wd07fvj7hjhxe5bsldcml/GTMate_v1.2.0.zip?rlkey=lvt8ffbgv6cvmwy2epb21fqa0&st=u11pq5sg&dl=1",
+    "min_updater_protocol": 2,
+    "transactional_package": {
+        "type": "zip",
+        "url": "https://www.dropbox.com/scl/fi/wd07fvj7hjhxe5bsldcml/GTMate_v1.2.0.zip?rlkey=lvt8ffbgv6cvmwy2epb21fqa0&st=u11pq5sg&dl=1",
+        "size": 332094517,
+        "sha256": "cdb8f4c80bfe5984c8f5e8f92749452bd3a0dbfbb010c8afc74662b00e14f234",
+        "package_manifest": "installed_manifest.json"
+    }
 }

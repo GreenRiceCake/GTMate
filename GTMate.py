@@ -14,6 +14,10 @@ import threading
 import importlib.metadata
 import ipaddress
 import numpy as np
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 import discord
 from discord import opus
 from discord.ext import commands, voice_recv
@@ -42,7 +46,8 @@ SHARED_GAME_STATE = {
     "last_lap_ms": -1,
     "rank": 0,
     "total_cars": 0,
-    "on_track": False
+    "on_track": False,
+    "race_active": False,
 }
 
 RADIO_UI_STATE = {
@@ -72,22 +77,99 @@ PIPER_MODEL = os.path.join(BASE_DIR, "models", "piper", "ttsmodel.onnx")
 VOSK_MODEL_PATH = os.path.join(BASE_DIR, "models", "vosk")
 FFMPEG_EXE = os.path.join(BASE_DIR, "bin", "ffmpeg.exe")
 UPDATER_EXE = os.path.join(BASE_DIR, "Updater.exe")
+PENDING_UPDATER_EXE = os.path.join(BASE_DIR, "Updater.new.exe")
 opus_path = os.path.join(BASE_DIR, "bin", "libopus.dll")
 
 
 def load_bot_config_file():
     if not os.path.exists(CONFIG_PATH):
-        return {}
+        return normalize_settings({})
 
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             config = json.load(f)
         if not isinstance(config, dict):
             raise ValueError("configuration root must be an object")
-        return config
+        return normalize_settings(config)
     except (OSError, ValueError, json.JSONDecodeError) as e:
         print(f">>> [Config] Failed to load bot configuration: {type(e).__name__}")
-        return {}
+        return normalize_settings({})
+
+
+def normalize_audio_device(value):
+    if not isinstance(value, dict):
+        return None
+    name = str(value.get("name") or "").strip()
+    hostapi = str(value.get("hostapi") or "").strip()
+    if not name:
+        return None
+    return {"name": name, "hostapi": hostapi}
+
+
+def normalize_settings(config):
+    config = dict(config) if isinstance(config, dict) else {}
+    playstation = config.get("playstation")
+    playstation = dict(playstation) if isinstance(playstation, dict) else {}
+    radio = config.get("radio")
+    radio = dict(radio) if isinstance(radio, dict) else {}
+    discord_settings = radio.get("discord")
+    discord_settings = dict(discord_settings) if isinstance(discord_settings, dict) else {}
+    native_settings = radio.get("native")
+    native_settings = dict(native_settings) if isinstance(native_settings, dict) else {}
+
+    mode = str(radio.get("mode") or config.get("RADIO_MODE") or "discord").lower()
+    if mode not in {"discord", "native"}:
+        mode = "discord"
+
+    normalized = {
+        key: value
+        for key, value in config.items()
+        if key not in {"TOKEN", "CHANNEL_ID", "PS_IP", "RADIO_MODE"}
+    }
+    normalized.update(
+        {
+            "schema_version": 2,
+            "playstation": {
+                **playstation,
+                "ip": str(playstation.get("ip") or config.get("PS_IP") or "192.168.0.1"),
+            },
+            "radio": {
+                **radio,
+                "mode": mode,
+                "discord": {
+                    **discord_settings,
+                    "token": str(discord_settings.get("token") or config.get("TOKEN") or ""),
+                    "channel_id": str(
+                        discord_settings.get("channel_id") or config.get("CHANNEL_ID") or ""
+                    ),
+                },
+                "native": {
+                    **native_settings,
+                    "input_device": normalize_audio_device(native_settings.get("input_device")),
+                    "output_device": normalize_audio_device(native_settings.get("output_device")),
+                },
+            },
+        }
+    )
+    return normalized
+
+
+def save_bot_config_file(config):
+    config = normalize_settings(config)
+    temporary_path = CONFIG_PATH + ".tmp"
+    try:
+        with open(temporary_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
 
 try:
     if not discord.opus.is_loaded():
@@ -102,16 +184,223 @@ STATE_IDLE = 0
 STATE_WAITING_COMMAND = 1
 STATE_WAITING_FOLLOWUP = 2
 
-# [추가] 동의어 사전 (Alias)
-COMMAND_ALIASES = {
-    "wake": ["engineer", "mate", "chief", "radio", "hello", "hey", "new", "near", "gin", "beer", "ate"],
-    "fuel": ["fuel", "gas", "petrol", "consumption", "tank", "few", "fill", "few all"],
-    "rank": ["rank", "position", "place", "where am i"],
-    "current_lap": ["current lap", "lap", "current"],
-    "best_lap": ["best", "fastest", "record", "lap time"],
-    "last_lap": ["last", "previous", "lap time"],
-    "no": ["no", "nope", "negative", "cancel", "nothing", "done", "thanks", "thank you"]
+@dataclass(frozen=True)
+class RadioCommandDefinition:
+    aliases: tuple[str, ...]
+    response_builder: Optional[Callable] = None
+
+
+def build_fuel_response(data, _format_time):
+    liters = int(data['fuel_liters'])
+    if not data.get('laps_remain_ready'):
+        return f"Fuel is {liters} liters. I don't have enough data to estimate laps remaining yet."
+    return f"Fuel is {liters} liters. That's about {data['laps_remain']:.1f} laps."
+
+
+def build_rank_response(data, _format_time):
+    if not data.get('race_active'):
+        return ENGINEER_LINES["not_in_race"]
+    return f"Position {data['rank']} out of {data['total_cars']}."
+
+
+def build_current_lap_response(data, _format_time):
+    if not data.get('race_active'):
+        return ENGINEER_LINES["not_in_race"]
+    return f"Lap {data['current_lap']}."
+
+
+def build_best_lap_response(data, format_time):
+    if not data.get('race_active'):
+        return ENGINEER_LINES["not_in_race"]
+    if data['best_lap_ms'] <= 0:
+        return "No best lap set yet."
+    return f"Best lap is {format_time(data['best_lap_ms'])}."
+
+
+def build_last_lap_response(data, format_time):
+    if not data.get('race_active'):
+        return ENGINEER_LINES["not_in_race"]
+    if data['last_lap_ms'] <= 0:
+        return "No last lap data."
+    return f"Last lap was {format_time(data['last_lap_ms'])}."
+
+
+RADIO_COMMANDS = {
+    "wake": RadioCommandDefinition((
+        "engineer", "mate", "chief", "radio", "hello", "hey",
+        "new", "near", "gin", "beer", "ate",
+    )),
+    "fuel": RadioCommandDefinition(
+        ("fuel", "gas", "petrol", "consumption", "tank", "few", "fill", "few all"),
+        build_fuel_response,
+    ),
+    "rank": RadioCommandDefinition(
+        ("rank", "position", "place", "where am i"),
+        build_rank_response,
+    ),
+    "current_lap": RadioCommandDefinition(
+        ("current lap", "lap", "current"),
+        build_current_lap_response,
+    ),
+    "best_lap": RadioCommandDefinition(
+        ("best", "fastest", "record", "lap time"),
+        build_best_lap_response,
+    ),
+    "last_lap": RadioCommandDefinition(
+        ("last", "previous", "lap time"),
+        build_last_lap_response,
+    ),
+    "no": RadioCommandDefinition(
+        ("no", "nope", "negative", "cancel", "nothing", "done", "thanks", "thank you")
+    ),
 }
+
+TELEMETRY_COMMAND_KEYS = tuple(
+    key for key, definition in RADIO_COMMANDS.items() if definition.response_builder
+)
+
+ENGINEER_LINES = {
+    "wake": "Yes mate, Go ahead.",
+    "cancel": "Copy that. Standing by.",
+    "follow_up": "Anything else?",
+    "missing_data": "I don't have that data.",
+    "command_timeout": "Standing by.",
+    "follow_up_timeout": "Radio out.",
+    "discord_connected": "Radio check. Connected.",
+    "native_connected": "Radio check. Native audio connected.",
+    "not_in_race": "You're not currently in a race.",
+    "new_best_lap": (
+        "New best lap. {lap_time}. "
+        "That's {delta_time} faster than your previous best."
+    ),
+    "low_fuel": "Fuel warning. About {laps} laps remaining.",
+    "pit_box": "Box, Box, Box.",
+    "pit_exit": "Push now! Clear track.",
+    "tire_cold": "{subject} {verb} still cold.",
+    "tire_hot": "{subject} {verb} still running hot.",
+}
+
+
+TIRE_POSITION_NAMES = (
+    "Front left tire",
+    "Front right tire",
+    "Rear left tire",
+    "Rear right tire",
+)
+
+
+def describe_tire_positions(indices):
+    remaining = set(indices)
+    if not remaining:
+        return "", False
+    if remaining == {0, 1, 2, 3}:
+        return "All tires", True
+
+    parts = []
+    for label, pair in (
+        ("Front tires", {0, 1}),
+        ("Rear tires", {2, 3}),
+        ("Left tires", {0, 2}),
+        ("Right tires", {1, 3}),
+    ):
+        if pair <= remaining:
+            parts.append(label)
+            remaining -= pair
+            break
+
+    for index in range(4):
+        if index in remaining:
+            parts.append(TIRE_POSITION_NAMES[index])
+
+    return " and ".join(parts), len(indices) > 1
+
+
+def build_tire_temperature_warning(cold_indices, hot_indices):
+    sentences = []
+    cold_subject, cold_plural = describe_tire_positions(cold_indices)
+    hot_subject, hot_plural = describe_tire_positions(hot_indices)
+    if cold_subject:
+        sentences.append(
+            ENGINEER_LINES["tire_cold"].format(
+                subject=cold_subject,
+                verb="are" if cold_plural else "is",
+            )
+        )
+    if hot_subject:
+        sentences.append(
+            ENGINEER_LINES["tire_hot"].format(
+                subject=hot_subject,
+                verb="are" if hot_plural else "is",
+            )
+        )
+    return " ".join(sentences)
+
+
+def list_audio_devices(kind):
+    if sd is None:
+        return []
+    channel_key = "max_input_channels" if kind == "input" else "max_output_channels"
+    hostapis = sd.query_hostapis()
+    devices = []
+    for index, device in enumerate(sd.query_devices()):
+        if int(device.get(channel_key, 0)) <= 0:
+            continue
+        hostapi_index = int(device.get("hostapi", 0))
+        hostapi_name = str(hostapis[hostapi_index].get("name") or "")
+        descriptor = {"name": str(device.get("name") or ""), "hostapi": hostapi_name}
+        label = f"{descriptor['name']} ({hostapi_name})"
+        devices.append((label, descriptor, index))
+    return devices
+
+
+def get_default_audio_device_label(kind):
+    if sd is None:
+        return "System default (unavailable)"
+
+    try:
+        default_devices = sd.default.device
+        default_index = default_devices[0 if kind == "input" else 1]
+        if default_index is None or int(default_index) < 0:
+            return "System default (not configured)"
+
+        default_index = int(default_index)
+        device = sd.query_devices(default_index)
+        hostapis = sd.query_hostapis()
+        hostapi_index = int(device.get("hostapi", 0))
+        hostapi_name = str(hostapis[hostapi_index].get("name") or "")
+        device_name = str(device.get("name") or "Unknown device")
+        return f"System default - {device_name} ({hostapi_name})"
+    except Exception:
+        return "System default (unknown device)"
+
+
+def resolve_audio_device(selection, kind):
+    selection = normalize_audio_device(selection)
+    if selection is None:
+        return None
+    devices = list_audio_devices(kind)
+    for _label, descriptor, index in devices:
+        if descriptor == selection:
+            return index
+    for _label, descriptor, index in devices:
+        if descriptor["name"] == selection["name"]:
+            return index
+    return None
+
+
+def resample_mono_pcm(pcm_bytes, source_rate, target_rate=16000):
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if samples.size == 0:
+        return b""
+    source_rate = int(round(source_rate))
+    if source_rate == target_rate:
+        return samples.tobytes()
+    output_size = max(1, int(round(samples.size * target_rate / source_rate)))
+    source_positions = np.arange(samples.size, dtype=np.float64)
+    target_positions = np.arange(output_size, dtype=np.float64) * source_rate / target_rate
+    target_positions = np.minimum(target_positions, samples.size - 1)
+    output = np.interp(target_positions, source_positions, samples.astype(np.float64))
+    return np.clip(output, -32768, 32767).astype(np.int16).tobytes()
 
 @dataclass
 class TelemetryPacket:
@@ -292,8 +581,11 @@ class GTMateVoiceClient(voice_recv.VoiceRecvClient):
             discord.VoiceClient.stop(self)
 
 class EngineerBot(commands.Bot):
-    def __init__(self):
-        verify_discord_voice_stack()
+    def __init__(self, mode="discord", config=None):
+        self.radio_mode = mode if mode in {"discord", "native"} else "discord"
+        self.config = normalize_settings(config or load_bot_config_file())
+        if self.radio_mode == "discord":
+            verify_discord_voice_stack()
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -327,6 +619,12 @@ class EngineerBot(commands.Bot):
         self.last_handled_stt_time = 0.0
         self.last_partial_log_time = 0
         self.last_audio_level_log_time = 0
+        self.native_input_stream = None
+        self.native_input_rate = 16000
+        self.native_input_device = None
+        self.native_output_device = None
+        self.native_stop_event = None
+        self.last_native_status_log_time = 0
         self.recognizer = self.create_stt_recognizer()
 
     def create_stt_recognizer(self):
@@ -339,8 +637,8 @@ class EngineerBot(commands.Bot):
                 seen.add(item)
                 grammar_items.append(item)
 
-        for aliases in COMMAND_ALIASES.values():
-            for alias in aliases:
+        for definition in RADIO_COMMANDS.values():
+            for alias in definition.aliases:
                 add_item(alias)
                 for word in alias.split():
                     add_item(word)
@@ -364,7 +662,7 @@ class EngineerBot(commands.Bot):
         set_radio_ui_state("CONNECTING", f"Logged in as {self.user}")
         # 채널 자동 접속 로직 (설정 파일의 채널 ID 우선)
         cfg = self.load_config()
-        channel_id = str(cfg.get("CHANNEL_ID") or "").strip()
+        channel_id = str(cfg["radio"]["discord"].get("channel_id") or "").strip()
         channel = None
 
         if channel_id:
@@ -388,13 +686,93 @@ class EngineerBot(commands.Bot):
             set_radio_ui_state("CONNECTING", f"Joining {channel.name}")
             self.voice_client = await channel.connect(cls=GTMateVoiceClient, reconnect=True)
             self.start_voice_listener()
-            await self.speak_tts("Radio check. Connected.")
+            await self.speak_tts(ENGINEER_LINES["discord_connected"])
             set_radio_ui_state("STANDBY", "Waiting for wake word")
             if not self.processing_task:
                 self.processing_task = self.loop.create_task(self.process_audio_queue())
         else:
             print(">>> [Bot] No accessible voice channel found.")
             set_radio_ui_state("ERROR", "No accessible voice channel")
+
+    async def start_native(self):
+        if sd is None:
+            raise RuntimeError("Native radio requires the sounddevice package.")
+
+        native_config = self.config["radio"]["native"]
+        self.native_input_device = resolve_audio_device(
+            native_config.get("input_device"), "input"
+        )
+        self.native_output_device = resolve_audio_device(
+            native_config.get("output_device"), "output"
+        )
+        input_info = sd.query_devices(self.native_input_device, "input")
+        output_info = sd.query_devices(self.native_output_device, "output")
+        default_rate = int(round(float(input_info.get("default_samplerate") or 48000)))
+        self.native_input_rate = 16000
+        try:
+            sd.check_input_settings(
+                device=self.native_input_device,
+                channels=1,
+                dtype="int16",
+                samplerate=self.native_input_rate,
+            )
+        except Exception:
+            self.native_input_rate = default_rate
+
+        output_rate = int(
+            round(float(output_info.get("default_samplerate") or 48000))
+        )
+        sd.check_output_settings(
+            device=self.native_output_device,
+            channels=1,
+            dtype="int16",
+            samplerate=output_rate,
+        )
+
+        blocksize = max(160, int(self.native_input_rate * 0.05))
+        self.native_stop_event = asyncio.Event()
+        self.native_input_stream = sd.RawInputStream(
+            device=self.native_input_device,
+            channels=1,
+            samplerate=self.native_input_rate,
+            dtype="int16",
+            blocksize=blocksize,
+            callback=self.native_input_callback,
+        )
+        self.native_input_stream.start()
+        if not self.processing_task:
+            self.processing_task = self.loop.create_task(self.process_audio_queue())
+
+        input_name = str(input_info.get("name") or "System default")
+        output_name = str(output_info.get("name") or "System default")
+        print(
+            f">>> [Native] audio ready: input={input_name}, output={output_name}, "
+            f"input_rate={self.native_input_rate}, block={blocksize}"
+        )
+        set_radio_ui_state("CONNECTING", "Native audio ready")
+        if not await self.speak_tts(ENGINEER_LINES["native_connected"]):
+            raise RuntimeError("Native output test failed.")
+        set_radio_ui_state("STANDBY", "Waiting for wake word")
+
+    async def wait_for_native_stop(self):
+        if self.native_stop_event is not None:
+            await self.native_stop_event.wait()
+
+    def native_input_callback(self, indata, _frames, _time_info, status):
+        if status:
+            now = time.time()
+            if now - self.last_native_status_log_time > 2:
+                self.last_native_status_log_time = now
+                print(f">>> [Native] input status: {status}")
+        if self.is_speaking or not getattr(self, "loop", None):
+            return
+        pcm = resample_mono_pcm(bytes(indata), self.native_input_rate, 16000)
+        if not pcm:
+            return
+        try:
+            self.loop.call_soon_threadsafe(self.enqueue_stt_audio, pcm)
+        except RuntimeError:
+            pass
 
     def start_voice_listener(self):
         if not self.voice_client or not self.voice_client.is_connected():
@@ -463,7 +841,8 @@ class EngineerBot(commands.Bot):
             self.listener_restarting = False
 
     def load_config(self):
-        return load_bot_config_file()
+        self.config = load_bot_config_file()
+        return self.config
 
     def sink_callback(self, user, data: voice_recv.VoiceData):
         if user == self.user: return
@@ -522,7 +901,10 @@ class EngineerBot(commands.Bot):
 
     def match_keyword(self, text, target_keys):
         for key in target_keys:
-            for alias in COMMAND_ALIASES.get(key, []):
+            definition = RADIO_COMMANDS.get(key)
+            if not definition:
+                continue
+            for alias in definition.aliases:
                 if alias in text: return key
         return None
 
@@ -537,38 +919,62 @@ class EngineerBot(commands.Bot):
 
         self.last_handled_stt_text = text
         self.last_handled_stt_time = now
-        set_radio_ui_state("HEARD", f'Heard "{text}"', text)
 
         if now - self.last_partial_log_time > 1:
             self.last_partial_log_time = now
             print(f">>> [STT] text='{text}' state={self.state}")
 
-        # [중요] 타임아웃 리셋
-        self.last_interaction_time = time.time()
-
         # 상태 머신 로직
         if self.state == STATE_IDLE:
-            if self.match_keyword(text, ["wake"]):
+            if not self.match_keyword(text, ["wake"]):
+                set_radio_ui_state("STANDBY", "Waiting for wake word", "")
+                print(f">>> [Radio] ignored while on standby: '{text}'")
+                return
+
+            self.last_interaction_time = now
+            self.recognizer.Reset()
+            self.stt_buffer.clear()
+            inline_command = self.match_keyword(
+                text, [*TELEMETRY_COMMAND_KEYS, "no"]
+            )
+            if inline_command and inline_command != "no":
+                self.state = STATE_WAITING_COMMAND
+                set_radio_ui_state(
+                    "COMMAND", f"Command: {inline_command}", text
+                )
+                print(f">>> [Radio] inline command accepted: {inline_command}")
+                await self.handle_interaction(inline_command)
+            else:
                 set_radio_ui_state("WAKE", f'Wake word: "{text}"', text)
-                self.recognizer.Reset()
-                self.stt_buffer.clear()
                 await self.handle_interaction("wake")
 
         elif self.state == STATE_WAITING_COMMAND:
-            cmd = self.match_keyword(text, ["fuel", "rank", "best_lap", "last_lap", "current_lap", "no"])
+            set_radio_ui_state("HEARD", f'Heard "{text}"', text)
+            cmd = self.match_keyword(text, [*TELEMETRY_COMMAND_KEYS, "no"])
             if cmd:
+                self.last_interaction_time = now
                 set_radio_ui_state("COMMAND", f"Command: {cmd}", text)
+                print(f">>> [Radio] command accepted: {cmd}")
                 self.recognizer.Reset()
                 self.stt_buffer.clear()
                 await self.handle_interaction(cmd)
+            else:
+                set_radio_ui_state("LISTENING", "Command not recognized", text)
+                print(f">>> [Radio] command not recognized: '{text}'")
 
         elif self.state == STATE_WAITING_FOLLOWUP:
-            cmd = self.match_keyword(text, ["no", "fuel", "rank", "best_lap", "last_lap", "current_lap"])
+            set_radio_ui_state("HEARD", f'Heard "{text}"', text)
+            cmd = self.match_keyword(text, ["no", *TELEMETRY_COMMAND_KEYS])
             if cmd:
+                self.last_interaction_time = now
                 set_radio_ui_state("COMMAND", f"Command: {cmd}", text)
+                print(f">>> [Radio] follow-up accepted: {cmd}")
                 self.recognizer.Reset()
                 self.stt_buffer.clear()
                 await self.handle_interaction(cmd)
+            else:
+                set_radio_ui_state("LISTENING", "Follow-up not recognized", text)
+                print(f">>> [Radio] follow-up not recognized: '{text}'")
 
     async def process_audio_queue(self):
         print(">>> [Bot] Listening...")
@@ -684,7 +1090,7 @@ class EngineerBot(commands.Bot):
         
         # 호출어 대응
         if key == "wake":
-            await self.speak_tts("Yes mate, Go ahead.")
+            await self.speak_tts(ENGINEER_LINES["wake"])
             self.state = STATE_WAITING_COMMAND
             set_radio_ui_state("LISTENING", "Listening for command")
             # 봇이 말을 마친 '지금' 시간을 기록
@@ -693,7 +1099,7 @@ class EngineerBot(commands.Bot):
         
         elif key == "no":
             self.state = STATE_IDLE
-            await self.speak_tts("Copy that. Standing by.")
+            await self.speak_tts(ENGINEER_LINES["cancel"])
             set_radio_ui_state("STANDBY", "Waiting for wake word")
             self.recognizer.Reset()
 
@@ -701,7 +1107,7 @@ class EngineerBot(commands.Bot):
             response = self.get_telemetry_response(key)
             if response:
                 await self.speak_tts(response)
-                await self.speak_tts("Anything else?") # 이 말이 끝날 때까지 아래 코드는 대기함
+                await self.speak_tts(ENGINEER_LINES["follow_up"])
                 
                 # [수정 핵심] 봇이 "Anything else?"라고 물어본 직후에 시간을 초기화
                 self.last_interaction_time = time.time() 
@@ -711,7 +1117,7 @@ class EngineerBot(commands.Bot):
                 # 대기 시간을 10초에서 15초로 늘리는 것을 추천합니다.
                 self.loop.create_task(self.check_timeout(15, STATE_WAITING_FOLLOWUP))
             else:
-                await self.speak_tts("I don't have that data.")
+                await self.speak_tts(ENGINEER_LINES["missing_data"])
                 self.last_interaction_time = time.time() # 여기서도 시간 갱신
                 self.state = STATE_WAITING_COMMAND
                 set_radio_ui_state("LISTENING", "Listening for command")
@@ -728,9 +1134,9 @@ class EngineerBot(commands.Bot):
         if self.state == monitor_state:
             if time.time() - self.last_interaction_time >= duration:
                 if monitor_state == STATE_WAITING_COMMAND:
-                    await self.speak_tts("Standing by.")
+                    await self.speak_tts(ENGINEER_LINES["command_timeout"])
                 elif monitor_state == STATE_WAITING_FOLLOWUP:
-                    await self.speak_tts("Radio out.")
+                    await self.speak_tts(ENGINEER_LINES["follow_up_timeout"])
                 self.state = STATE_IDLE
                 set_radio_ui_state("STANDBY", "Waiting for wake word")
                 self.recognizer.Reset()
@@ -776,8 +1182,9 @@ class EngineerBot(commands.Bot):
                     break
             self.stt_buffer.clear()
             
-            # 3. [핵심] 실제 루프 함수인 'process_audio_queue' 다시 실행
-            self.start_voice_listener()
+            # 3. 실제 입력 listener와 공통 인식 루프 다시 실행
+            if self.radio_mode == "discord":
+                self.start_voice_listener()
             self.processing_task = self.loop.create_task(self.process_audio_queue())
             
             # 4. 상태 초기화
@@ -785,35 +1192,16 @@ class EngineerBot(commands.Bot):
             self.state = STATE_IDLE # 대기 상태로 리셋
             self.recognizer.Reset()
             
-            print(">>> [Bot] 음성 인식 루프(process_audio_queue) 재시작 성공.")
+            print(">>> [Radio] 음성 인식 루프(process_audio_queue) 재시작 성공.")
         except Exception as e:
-            print(f">>> [Bot] 재시작 실패: {e}")
+            print(f">>> [Radio] 재시작 실패: {e}")
 
     # [핵심] 실제 GTMate 데이터 읽기
     def get_telemetry_response(self, key):
-        data = SHARED_GAME_STATE
-        
-        if key == "fuel":
-            liters = int(data['fuel_liters'])
-            if not data.get('laps_remain_ready'):
-                return f"Fuel is {liters} liters. I don't have enough data to estimate laps remaining yet."
-            return f"Fuel is {liters} liters. That's about {data['laps_remain']:.1f} laps."
-        
-        elif key == "rank":
-            return f"Position {data['rank']} out of {data['total_cars']}."
-
-        elif key == "current_lap":
-            return f"Lap {data['current_lap']}."
-        
-        elif key == "best_lap":
-            if data['best_lap_ms'] <= 0: return "No best lap set yet."
-            return f"Best lap is {self.format_time_tts(data['best_lap_ms'])}."
-            
-        elif key == "last_lap":
-            if data['last_lap_ms'] <= 0: return "No last lap data."
-            return f"Last lap was {self.format_time_tts(data['last_lap_ms'])}."
-            
-        return None
+        definition = RADIO_COMMANDS.get(key)
+        if not definition or not definition.response_builder:
+            return None
+        return definition.response_builder(SHARED_GAME_STATE, self.format_time_tts)
 
     def format_time_tts(self, ms):
         minutes = ms // 60000
@@ -825,6 +1213,8 @@ class EngineerBot(commands.Bot):
         return text
 
     async def speak_tts(self, text):
+        if self.radio_mode == "native":
+            return await self.speak_native_tts(text)
         if not self.voice_client or not self.voice_client.is_connected(): return
         if not text.strip(): return
         
@@ -897,6 +1287,94 @@ class EngineerBot(commands.Bot):
             else:
                 set_radio_ui_state("LISTENING", "Listening for command")
             print(">>> [디버그] speak_tts 종료")
+
+    async def speak_native_tts(self, text):
+        if sd is None or not text.strip():
+            return False
+
+        self.is_speaking = True
+        playback_succeeded = False
+        set_radio_ui_state("SPEAKING", text)
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        current_env = os.environ.copy()
+        current_env["PYTHONIOENCODING"] = "utf-8"
+        current_piper = os.path.abspath(PIPER_EXE)
+        abs_model_path = os.path.abspath(PIPER_MODEL)
+
+        try:
+            piper_cmd = [current_piper, "--model", abs_model_path, "--output-raw"]
+            process = subprocess.Popen(
+                piper_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=creation_flags,
+                cwd=os.path.dirname(current_piper),
+                env=current_env,
+            )
+            raw_pcm, error_output = process.communicate(
+                input=text.encode("utf-8"), timeout=15
+            )
+            if process.returncode or not raw_pcm:
+                error_text = error_output.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(error_text or "Piper returned no audio data.")
+
+            output_info = sd.query_devices(self.native_output_device, "output")
+            output_rate = int(
+                round(float(output_info.get("default_samplerate") or 48000))
+            )
+            output_pcm = resample_mono_pcm(raw_pcm, 22050, output_rate)
+            await asyncio.to_thread(
+                self.play_native_pcm,
+                output_pcm,
+                output_rate,
+                self.native_output_device,
+            )
+            await asyncio.sleep(0.2)
+            playback_succeeded = True
+        except Exception as e:
+            print(f">>> [Native] TTS error: {type(e).__name__}: {e}")
+            set_radio_ui_state("ERROR", f"Native output error: {e}")
+        finally:
+            self.is_speaking = False
+            if playback_succeeded:
+                if self.state == STATE_IDLE:
+                    set_radio_ui_state("STANDBY", "Waiting for wake word")
+                else:
+                    set_radio_ui_state("LISTENING", "Listening for command")
+        return playback_succeeded
+
+    @staticmethod
+    def play_native_pcm(pcm_bytes, sample_rate, device):
+        with sd.RawOutputStream(
+            device=device,
+            channels=1,
+            samplerate=sample_rate,
+            dtype="int16",
+        ) as output_stream:
+            output_stream.write(pcm_bytes)
+
+    async def close(self):
+        if self.native_input_stream is not None:
+            try:
+                self.native_input_stream.stop()
+                self.native_input_stream.close()
+            except Exception as e:
+                print(f">>> [Native] input close warning: {e}")
+            self.native_input_stream = None
+
+        if self.processing_task and not self.processing_task.done():
+            self.processing_task.cancel()
+            if self.processing_task is not asyncio.current_task():
+                try:
+                    await self.processing_task
+                except asyncio.CancelledError:
+                    pass
+        self.processing_task = None
+
+        if self.native_stop_event is not None:
+            self.native_stop_event.set()
+        await super().close()
 
 class GT7TelemetryReceiver:
     KEY = b'Simulator Interface Packet GT7 ver 0.0'
@@ -1008,10 +1486,16 @@ class RaceDashboard:
     BASE_WINDOW_HEIGHT = 800
     PIT_ENTRY_LOOKBACK_SECONDS = 0.5
     FUEL_LAP_RESET_CONFIRM_PACKETS = 3
+    TIRE_COLD_THRESHOLD = 60.0
+    TIRE_HOT_THRESHOLD = 80.0
+    TIRE_BOUNDARY_CAPTURE_WINDOW_MS = 5000
+    TIRE_WARNING_DELAY_MS = 20000
+    TIRE_WARNING_BUSY_RETRY_MS = 1000
+    TIRE_WARNING_MAX_BUSY_RETRIES = 5
 
     def __init__(self, root):
         self.root = root
-        self.root.title("GTMate 1.1.1")
+        self.root.title("GTMate 1.2.0")
         self.root.geometry(f"{self.BASE_WINDOW_WIDTH}x{self.BASE_WINDOW_HEIGHT}")
         self.root.configure(bg='#000000')
         self.fullscreen_enabled = False
@@ -1021,8 +1505,10 @@ class RaceDashboard:
         self.scalable_canvases = []
         self.scalable_progressbars = []
         self.scalable_frames = []
+        self.settings_window = None
+        self.settings_notebook = None
 
-        self.current_version = "1.1.1"
+        self.current_version = "1.2.0"
         self.update_check_started = False
         
         self.receiver = None
@@ -1033,13 +1519,18 @@ class RaceDashboard:
         self.connection_watchdog_after_id = None
         self.last_data_val = (0, 0)
         self.last_change_time = 0
+
+        self.bot = None
+        self.bot_running = False
+        self.bot_loop = None
+        self.bot_thread = None
+        self.radio_stop_requested = False
+        self.radio_worker_finished = False
+        self.radio_worker_error = None
         
         self.create_widgets()
         self.update_radio_status_display()
         self.max_rpm_seen = 5000
-
-        self.bot = None
-        self.bot_running = False
 
         # 부스트 게이지를 담을 프레임 (나중에 이 프레임 통째로 숨기거나 보임)
         self.boost_frame = tk.Frame(root, bg='black')
@@ -1068,6 +1559,13 @@ class RaceDashboard:
         self.fuel_strategy_reset_for_standby = False
         self.fuel_lap_reset_candidate = None
         self.fuel_lap_reset_count = 0
+
+        # 랩 경계 시점 기준 타이어 온도 경고 상태
+        self.tire_warning_observed_lap = None
+        self.tire_warning_boundary_state = None
+        self.tire_warning_after_id = None
+        self.tire_warning_pending_lap = None
+        self.tire_warning_last_announced_lap = None
         
         # [화면 표시용 노이즈 필터]
         self.display_fuel_pct = 100.0
@@ -1108,7 +1606,32 @@ class RaceDashboard:
         self.pit_entry_started_at = None
         self.pit_lane_started_at = None
         self.connection_watchdog_after_id = self.root.after(500, self.check_connection_watchdog)
-        self.root.after(1000, self.start_silent_update_check)
+        self.root.after(800, self.finalize_pending_updater)
+        self.root.after(2000, self.start_silent_update_check)
+
+    def finalize_pending_updater(self, attempt=0):
+        if not os.path.isfile(PENDING_UPDATER_EXE):
+            return
+
+        try:
+            os.replace(PENDING_UPDATER_EXE, UPDATER_EXE)
+            print(">>> [Update] Pending Updater replacement completed")
+        except FileNotFoundError:
+            # The legacy updater's finishing script completed first.
+            return
+        except Exception as e:
+            if attempt < 119:
+                if attempt == 0 or (attempt + 1) % 10 == 0:
+                    print(
+                        ">>> [Update] Pending Updater is still locked; "
+                        f"retrying ({attempt + 1}/120): {e}"
+                    )
+                self.root.after(
+                    500,
+                    lambda: self.finalize_pending_updater(attempt + 1),
+                )
+                return
+            print(f">>> [Update] Pending Updater replacement failed: {e}")
 
     def start_silent_update_check(self):
         if self.update_check_started:
@@ -1143,7 +1666,11 @@ class RaceDashboard:
         # 1. PS IP 설정
         tk.Label(top_frame, text="PS IP:", bg='#1a1a1a', fg='gray').pack(side=tk.LEFT, padx=5)
         self.ip_entry = tk.Entry(top_frame, font=('Arial', 10), width=12)
-        self.ip_entry.insert(0, "192.168.0.1")
+        initial_config = load_bot_config_file()
+        self.ip_entry.insert(
+            0,
+            str(initial_config["playstation"].get("ip") or "192.168.0.1"),
+        )
         self.ip_entry.pack(side=tk.LEFT, padx=5)
         
         self.connect_btn = tk.Button(top_frame, text="Connect PS", command=self.toggle_connection, bg='#00ff00', font=('Arial', 10, 'bold'))
@@ -1156,12 +1683,12 @@ class RaceDashboard:
         self.status_label.pack(side=tk.LEFT, padx=10)
 
         # ----------------------------------------------------
-        # [봇 제어 버튼 추가]
+        # [설정 및 라디오 제어]
         # ----------------------------------------------------
         tk.Frame(top_frame, width=2, bg='#333').pack(side=tk.LEFT, fill=tk.Y, padx=10) # 구분선
 
-        self.btn_bot_config = tk.Button(top_frame, text="Bot Config", command=self.open_bot_config, bg='#444', fg='white', font=('Arial', 9))
-        self.btn_bot_config.pack(side=tk.LEFT, padx=5)
+        self.btn_settings = tk.Button(top_frame, text="Settings", command=self.open_settings, bg='#444', fg='white', font=('Arial', 9))
+        self.btn_settings.pack(side=tk.LEFT, padx=5)
 
         self.btn_bot_toggle = tk.Button(top_frame, text="Start Radio", command=self.toggle_bot, bg='#0080ff', fg='white', font=('Arial', 10, 'bold'))
         self.btn_bot_toggle.pack(side=tk.LEFT, padx=5)
@@ -1615,6 +2142,8 @@ class RaceDashboard:
     def start_connection(self):
         ps_ip = self.ip_entry.get().strip()
         if not ps_ip: return
+        SHARED_GAME_STATE['on_track'] = False
+        SHARED_GAME_STATE['race_active'] = False
         self.status_label.config(text="● 연결 시도 중", fg='orange')
         self.current_packet = None
         self.last_packet_time = 0
@@ -1628,6 +2157,8 @@ class RaceDashboard:
 
     def stop_connection(self):
         if self.receiver: self.receiver.stop()
+        SHARED_GAME_STATE['on_track'] = False
+        SHARED_GAME_STATE['race_active'] = False
         self.receiver = None
         self.current_packet = None
         self.last_packet_time = 0
@@ -1645,6 +2176,8 @@ class RaceDashboard:
             if reference_time and time.time() - reference_time > 2.0:
                 if not self.connection_timed_out:
                     self.connection_timed_out = True
+                    SHARED_GAME_STATE['on_track'] = False
+                    SHARED_GAME_STATE['race_active'] = False
                     self.status_label.config(text="● 연결 실패/대기", fg='red')
                     self.show_connection_lost_data()
                     print(">>> [PS] Packet timeout: no telemetry received for 2 seconds.")
@@ -1664,11 +2197,189 @@ class RaceDashboard:
         SHARED_GAME_STATE['last_lap_ms'] = packet.last_lap
         SHARED_GAME_STATE['rank'] = packet.race_rank
         SHARED_GAME_STATE['total_cars'] = packet.total_cars
+        SHARED_GAME_STATE['on_track'] = GT7Flags.check(
+            packet.flags, GT7Flags.CAR_ON_TRACK
+        )
+        SHARED_GAME_STATE['race_active'] = (
+            packet.lap_count != -1 and packet.race_rank not in (-1, 0xFF)
+        )
         self.root.after(0, self.update_gui)
 
     def speak_engineer(self, text):
-        if self.bot and self.bot.loop and self.bot.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.bot.speak_tts(text), self.bot.loop)
+        if self.bot and self.bot_loop and self.bot_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.bot.speak_tts(text), self.bot_loop
+            )
+            return True
+        return False
+
+    def cancel_pending_tire_warning(self):
+        if self.tire_warning_after_id is not None:
+            try:
+                self.root.after_cancel(self.tire_warning_after_id)
+            except Exception:
+                pass
+        self.tire_warning_after_id = None
+        self.tire_warning_pending_lap = None
+
+    def reset_tire_temperature_warning(self):
+        self.cancel_pending_tire_warning()
+        self.tire_warning_observed_lap = None
+        self.tire_warning_boundary_state = None
+        self.tire_warning_last_announced_lap = None
+
+    def classify_tire_temperatures(self, temperatures):
+        cold = {
+            index
+            for index, temperature in enumerate(temperatures)
+            if temperature < self.TIRE_COLD_THRESHOLD
+        }
+        hot = {
+            index
+            for index, temperature in enumerate(temperatures)
+            if temperature >= self.TIRE_HOT_THRESHOLD
+        }
+        return cold, hot
+
+    def update_tire_temperature_warning(self, packet):
+        race_is_active = bool(SHARED_GAME_STATE.get('race_active'))
+        car_is_on_track = bool(SHARED_GAME_STATE.get('on_track'))
+        if (
+            not race_is_active
+            or not car_is_on_track
+            or self.pit_status != "TRACK"
+            or packet.lap_count <= 0
+        ):
+            if (
+                self.tire_warning_observed_lap is not None
+                or self.tire_warning_after_id is not None
+            ):
+                self.reset_tire_temperature_warning()
+            return
+
+        current_lap = packet.lap_count
+        current_state = self.classify_tire_temperatures(packet.tire_temps)
+
+        if self.tire_warning_observed_lap is None:
+            self.tire_warning_observed_lap = current_lap
+            # 랩 시작 직후 연결됐다면 첫 패킷도 경계 측정값으로 사용할 수 있습니다.
+            if (
+                0 <= packet.current_lap_ms
+                <= self.TIRE_BOUNDARY_CAPTURE_WINDOW_MS
+            ):
+                self.tire_warning_boundary_state = current_state
+                print(
+                    f">>> [Tires] Initial boundary captured at lap {current_lap}"
+                )
+            return
+
+        if current_lap == self.tire_warning_observed_lap:
+            return
+
+        previous_lap = self.tire_warning_observed_lap
+        self.tire_warning_observed_lap = current_lap
+        self.cancel_pending_tire_warning()
+
+        if current_lap != previous_lap + 1:
+            self.tire_warning_boundary_state = current_state
+            print(
+                f">>> [Tires] Lap sequence reset: {previous_lap}->{current_lap}"
+            )
+            return
+
+        if self.tire_warning_boundary_state is None:
+            self.tire_warning_boundary_state = current_state
+            print(f">>> [Tires] Boundary baseline set at lap {current_lap}")
+            return
+
+        previous_cold, previous_hot = self.tire_warning_boundary_state
+        current_cold, current_hot = current_state
+        candidate_cold = previous_cold & current_cold
+        candidate_hot = previous_hot & current_hot
+        self.tire_warning_boundary_state = current_state
+
+        print(
+            f">>> [Tires] Lap {current_lap} candidates: "
+            f"cold={sorted(candidate_cold)}, hot={sorted(candidate_hot)}"
+        )
+        if not candidate_cold and not candidate_hot:
+            return
+
+        self.tire_warning_pending_lap = current_lap
+        self.tire_warning_after_id = self.root.after(
+            self.TIRE_WARNING_DELAY_MS,
+            lambda lap=current_lap,
+                   cold=tuple(sorted(candidate_cold)),
+                   hot=tuple(sorted(candidate_hot)): self.evaluate_tire_warning(
+                       lap, cold, hot
+                   ),
+        )
+
+    def evaluate_tire_warning(
+        self, lap, candidate_cold, candidate_hot, busy_retry=0
+    ):
+        self.tire_warning_after_id = None
+        if (
+            self.tire_warning_pending_lap != lap
+            or self.tire_warning_last_announced_lap == lap
+        ):
+            return
+
+        packet = self.current_packet
+        if (
+            packet is None
+            or time.time() - self.last_packet_time > 2.0
+            or packet.lap_count != lap
+            or not SHARED_GAME_STATE.get('race_active')
+            or not SHARED_GAME_STATE.get('on_track')
+            or self.pit_status != "TRACK"
+        ):
+            self.tire_warning_pending_lap = None
+            print(f">>> [Tires] Lap {lap} warning discarded: state changed")
+            return
+
+        current_cold, current_hot = self.classify_tire_temperatures(
+            packet.tire_temps
+        )
+        confirmed_cold = set(candidate_cold) & current_cold
+        confirmed_hot = set(candidate_hot) & current_hot
+        if not confirmed_cold and not confirmed_hot:
+            self.tire_warning_pending_lap = None
+            print(f">>> [Tires] Lap {lap} temperatures returned to normal")
+            return
+
+        radio_is_busy = (
+            self.bot is not None
+            and (
+                self.bot.is_speaking
+                or self.bot.state != STATE_IDLE
+            )
+        )
+        if radio_is_busy:
+            if busy_retry < self.TIRE_WARNING_MAX_BUSY_RETRIES:
+                self.tire_warning_after_id = self.root.after(
+                    self.TIRE_WARNING_BUSY_RETRY_MS,
+                    lambda: self.evaluate_tire_warning(
+                        lap,
+                        tuple(sorted(confirmed_cold)),
+                        tuple(sorted(confirmed_hot)),
+                        busy_retry + 1,
+                    ),
+                )
+            else:
+                self.tire_warning_pending_lap = None
+                print(f">>> [Tires] Lap {lap} warning skipped: radio busy")
+            return
+
+        message = build_tire_temperature_warning(
+            confirmed_cold, confirmed_hot
+        )
+        self.tire_warning_pending_lap = None
+        if message and self.speak_engineer(message):
+            self.tire_warning_last_announced_lap = lap
+            print(f">>> [Tires] Lap {lap} warning: {message}")
+        elif message:
+            print(f">>> [Tires] Lap {lap} warning skipped: radio off")
 
     def reset_fuel_strategy(self, reason="standby"):
         if reason == "standby" and not self.fuel_strategy_reset_for_standby:
@@ -1706,9 +2417,9 @@ class RaceDashboard:
 
         if self.best_lap_seen_ms > 0 and best_lap_ms < self.best_lap_seen_ms:
             delta_ms = self.best_lap_seen_ms - best_lap_ms
-            msg = (
-                f"New best lap. {self.format_time_tts(best_lap_ms)}. "
-                f"That's {self.format_time_tts(delta_ms)} faster than your previous best."
+            msg = ENGINEER_LINES["new_best_lap"].format(
+                lap_time=self.format_time_tts(best_lap_ms),
+                delta_time=self.format_time_tts(delta_ms),
             )
             self.speak_engineer(msg)
 
@@ -1726,7 +2437,9 @@ class RaceDashboard:
 
         if threshold and threshold not in self.low_fuel_alerts_triggered:
             self.low_fuel_alerts_triggered.add(threshold)
-            self.speak_engineer(f"Fuel warning. About {threshold} laps remaining.")
+            self.speak_engineer(
+                ENGINEER_LINES["low_fuel"].format(laps=threshold)
+            )
 
     def update_gui(self):
         now = time.time()
@@ -1779,6 +2492,11 @@ class RaceDashboard:
         if not hasattr(self, 'radio_state_label'):
             return
 
+        if self.radio_worker_finished:
+            self.radio_worker_finished = False
+            self.set_radio_controls_stopped(self.radio_worker_error)
+            self.radio_worker_error = None
+
         status = RADIO_UI_STATE.get("status", "OFF")
         detail = RADIO_UI_STATE.get("detail", "")
         heard = RADIO_UI_STATE.get("heard", "")
@@ -1788,6 +2506,7 @@ class RaceDashboard:
             "STANDBY": "#888888",
             "STARTING": "orange",
             "CONNECTING": "orange",
+            "STOPPING": "orange",
             "LISTENING": "#00ff00",
             "HEARD": "#00ffff",
             "WAKE": "#00ffff",
@@ -1945,9 +2664,7 @@ class RaceDashboard:
                 self.pit_lane_started_at = now
             if new_status in ("PIT_LANE", "PIT_WORK") and not self.pit_box_announced:
                 self.pit_box_announced = True
-                if self.bot and self.bot.loop:
-                    asyncio.run_coroutine_threadsafe(self.bot.speak_tts("Box, Box, Box."), self.bot.loop)
-                    asyncio.run_coroutine_threadsafe(self.bot.restart_listener(), self.bot.loop)
+                self.speak_engineer(ENGINEER_LINES["pit_box"])
             if new_status == "TRACK" and self.pit_status != "TRACK":
                 self.fuel_at_lap_start = p.fuel_level
                 self.last_lap_count = p.lap_count
@@ -1955,11 +2672,9 @@ class RaceDashboard:
                 self.pit_entry_started_at = None
                 self.pit_lane_started_at = None
                 self.pit_box_announced = False
-                if self.bot and self.bot.loop:
-                    asyncio.run_coroutine_threadsafe(self.bot.speak_tts("Push now! Clear track."), self.bot.loop)
-                    asyncio.run_coroutine_threadsafe(self.bot.restart_listener(), self.bot.loop)
+                self.speak_engineer(ENGINEER_LINES["pit_exit"])
                 print(f">>> [Fuel] Pit exit baseline reset: lap={p.lap_count}, fuel={p.fuel_level:.2f}")
-                print(">>> [System] 피트 아웃: 음성 인식 루프 재시작 명령 전송")
+                print(">>> [System] 피트 아웃: 엔지니어 안내 전송")
             elif new_status != "PIT_ENTRY":
                 self.pit_entry_started_at = None
                 if new_status != "PIT_LANE":
@@ -1973,6 +2688,7 @@ class RaceDashboard:
         self.last_vehicle_dynamics_raw = p.vehicle_dynamics_raw
         self.last_fuel_level_for_pit = p.fuel_level
         self.last_tire_temps_for_pit = p.tire_temps
+        self.update_tire_temperature_warning(p)
 
 
         # -------------------------------------------------------------------------
@@ -2201,10 +2917,16 @@ class RaceDashboard:
         for f in [self.flag_asm, self.flag_tcs, self.flag_beam, self.flag_hand]: f.config(fg='#333')
 
     def show_connection_lost_data(self):
+        SHARED_GAME_STATE['on_track'] = False
+        SHARED_GAME_STATE['race_active'] = False
+        self.reset_tire_temperature_warning()
         self.replay_label.config(text="STATUS: CONNECTION LOST", fg='#ff4444')
         self.clear_dashboard_values()
 
     def show_empty_data(self):
+        SHARED_GAME_STATE['on_track'] = False
+        SHARED_GAME_STATE['race_active'] = False
+        self.reset_tire_temperature_warning()
         self.replay_label.config(text="STATUS: STANDBY", fg='#666666')
         self.pit_status = "TRACK"
         self.pit_stopped_since = None
@@ -2229,104 +2951,415 @@ class RaceDashboard:
         return f"{minutes:02d}:{seconds:02d}.{ms % 1000:03d}"
 
     # ---------------------------------------------------
-    # [봇 관련 메서드]
+    # [설정 및 봇 관련 메서드]
     # ---------------------------------------------------
-    def open_bot_config(self):
-        # 간단한 팝업창으로 토큰/채널ID 입력
+    def open_settings(self, initial_tab="general"):
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.deiconify()
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            if initial_tab == "radio" and self.settings_notebook:
+                self.settings_notebook.select(1)
+            return
+
         win = tk.Toplevel(self.root)
-        win.title("Bot Configuration")
-        win.geometry("420x235")
-        
+        self.settings_window = win
+        win.title("GTMate Settings")
+        win.geometry("600x460")
+        win.minsize(560, 420)
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+
         config = load_bot_config_file()
-            
-        tk.Label(win, text="Discord Bot Token:").pack(pady=5)
-        e_token = tk.Entry(win, width=40)
-        e_token.insert(0, str(config.get("TOKEN") or ""))
-        e_token.pack()
-        
-        tk.Label(win, text="Voice Channel ID:").pack(pady=5)
-        e_channel = tk.Entry(win, width=40)
-        e_channel.insert(0, str(config.get("CHANNEL_ID") or ""))
-        e_channel.pack()
+
+        notebook = ttk.Notebook(win)
+        self.settings_notebook = notebook
+        notebook.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 8))
+
+        general_tab = ttk.Frame(notebook, padding=16)
+        radio_tab = ttk.Frame(notebook, padding=16)
+        notebook.add(general_tab, text="General")
+        notebook.add(radio_tab, text="Team Radio")
+
+        general_tab.columnconfigure(0, weight=1)
+        ps_frame = ttk.LabelFrame(general_tab, text="PlayStation", padding=14)
+        ps_frame.grid(row=0, column=0, sticky="ew")
+        ps_frame.columnconfigure(1, weight=1)
+        ttk.Label(ps_frame, text="Default IP address").grid(
+            row=0, column=0, sticky="w", padx=(0, 14), pady=5
+        )
+        e_ps_ip = ttk.Entry(ps_frame)
+        e_ps_ip.insert(
+            0,
+            str(config["playstation"].get("ip") or self.ip_entry.get().strip()),
+        )
+        e_ps_ip.grid(row=0, column=1, sticky="ew", pady=5)
+
+        radio_tab.columnconfigure(0, weight=1)
+        mode_frame = ttk.LabelFrame(radio_tab, text="Mode", padding=10)
+        mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        mode_var = tk.StringVar(value=config["radio"]["mode"])
+
+        ttk.Radiobutton(
+            mode_frame,
+            text="Discord",
+            value="discord",
+            variable=mode_var,
+        ).pack(side=tk.LEFT, padx=(4, 18))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Native",
+            value="native",
+            variable=mode_var,
+        ).pack(side=tk.LEFT, padx=4)
+
+        discord_frame = ttk.LabelFrame(radio_tab, text="Discord", padding=14)
+        discord_frame.grid(row=1, column=0, sticky="ew")
+        discord_frame.columnconfigure(1, weight=1)
+
+        discord_config = config["radio"]["discord"]
+
+        ttk.Label(discord_frame, text="Bot token").grid(
+            row=0, column=0, sticky="w", padx=(0, 14), pady=5
+        )
+        e_token = ttk.Entry(discord_frame, show="*")
+        e_token.insert(0, str(discord_config.get("token") or ""))
+        e_token.grid(row=0, column=1, sticky="ew", pady=5)
+
+        ttk.Label(discord_frame, text="Voice channel ID").grid(
+            row=1, column=0, sticky="w", padx=(0, 14), pady=5
+        )
+        e_channel = ttk.Entry(discord_frame)
+        e_channel.insert(0, str(discord_config.get("channel_id") or ""))
+        e_channel.grid(row=1, column=1, sticky="ew", pady=5)
+
+        show_token_var = tk.BooleanVar(value=False)
+
+        def update_token_visibility():
+            e_token.configure(show="" if show_token_var.get() else "*")
+
+        ttk.Checkbutton(
+            discord_frame,
+            text="Show token",
+            variable=show_token_var,
+            command=update_token_visibility,
+        ).grid(row=2, column=1, sticky="w", pady=(8, 0))
+
+        native_frame = ttk.LabelFrame(radio_tab, text="Native audio", padding=14)
+        native_frame.columnconfigure(1, weight=1)
+        ttk.Label(native_frame, text="Microphone").grid(
+            row=0, column=0, sticky="w", padx=(0, 14), pady=5
+        )
+        input_device_var = tk.StringVar(value="System default")
+        input_device_combo = ttk.Combobox(
+            native_frame, textvariable=input_device_var, state="readonly"
+        )
+        input_device_combo.grid(row=0, column=1, sticky="ew", pady=5)
+
+        ttk.Label(native_frame, text="Output device").grid(
+            row=1, column=0, sticky="w", padx=(0, 14), pady=5
+        )
+        output_device_var = tk.StringVar(value="System default")
+        output_device_combo = ttk.Combobox(
+            native_frame, textvariable=output_device_var, state="readonly"
+        )
+        output_device_combo.grid(row=1, column=1, sticky="ew", pady=5)
+
+        audio_status_var = tk.StringVar(value="")
+        ttk.Label(native_frame, textvariable=audio_status_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        input_device_map = {}
+        output_device_map = {}
+        audio_devices_loaded = False
+
+        def selected_device_label(device_map, saved_selection, default_label):
+            saved_selection = normalize_audio_device(saved_selection)
+            for label, descriptor in device_map.items():
+                if descriptor == saved_selection:
+                    return label
+            return default_label
+
+        def refresh_audio_devices():
+            nonlocal audio_devices_loaded
+            previous_input = input_device_map.get(input_device_var.get())
+            previous_output = output_device_map.get(output_device_var.get())
+            input_device_map.clear()
+            output_device_map.clear()
+            default_input_label = get_default_audio_device_label("input")
+            default_output_label = get_default_audio_device_label("output")
+            input_device_map[default_input_label] = None
+            output_device_map[default_output_label] = None
+            if sd is not None:
+                for label, descriptor, _index in list_audio_devices("input"):
+                    input_device_map[label] = descriptor
+                for label, descriptor, _index in list_audio_devices("output"):
+                    output_device_map[label] = descriptor
+
+            input_device_combo["values"] = tuple(input_device_map)
+            output_device_combo["values"] = tuple(output_device_map)
+            native_config = config["radio"]["native"]
+            wanted_input = (
+                previous_input
+                if audio_devices_loaded
+                else native_config.get("input_device")
+            )
+            wanted_output = (
+                previous_output
+                if audio_devices_loaded
+                else native_config.get("output_device")
+            )
+            input_device_var.set(
+                selected_device_label(
+                    input_device_map, wanted_input, default_input_label
+                )
+            )
+            output_device_var.set(
+                selected_device_label(
+                    output_device_map, wanted_output, default_output_label
+                )
+            )
+            audio_devices_loaded = True
+            if sd is None:
+                audio_status_var.set("Native audio is unavailable.")
+            else:
+                audio_status_var.set(
+                    f"{len(input_device_map) - 1} inputs, "
+                    f"{len(output_device_map) - 1} outputs"
+                )
+
+        ttk.Button(
+            native_frame,
+            text="Refresh devices",
+            command=refresh_audio_devices,
+        ).grid(row=3, column=1, sticky="e", pady=(12, 0))
+
+        def update_mode_panel(*_args):
+            if mode_var.get() == "native":
+                discord_frame.grid_remove()
+                native_frame.grid(row=1, column=0, sticky="ew")
+            else:
+                native_frame.grid_remove()
+                discord_frame.grid(row=1, column=0, sticky="ew")
+
+        mode_var.trace_add("write", update_mode_panel)
+        refresh_audio_devices()
+        update_mode_panel()
 
         config_error_var = tk.StringVar(value="")
-        tk.Label(win, textvariable=config_error_var, fg='#ff4444').pack(pady=(5, 0))
-        
+        error_label = tk.Label(win, textvariable=config_error_var, fg='#cc2222')
+        error_label.grid(row=1, column=0, sticky="w", padx=16)
+
+        button_frame = ttk.Frame(win)
+        button_frame.grid(row=2, column=0, sticky="e", padx=12, pady=(8, 12))
+
+        def close_settings():
+            self.settings_window = None
+            self.settings_notebook = None
+            win.destroy()
+
         def save():
-            channel_id = e_channel.get().strip()
-            if channel_id and not channel_id.isdigit():
-                config_error_var.set("Voice Channel ID must contain digits only.")
+            ps_ip = e_ps_ip.get().strip()
+            try:
+                parsed_ip = ipaddress.ip_address(ps_ip)
+                if parsed_ip.version != 4:
+                    raise ValueError
+            except ValueError:
+                notebook.select(general_tab)
+                config_error_var.set("PlayStation IP must be a valid IPv4 address.")
+                e_ps_ip.focus_set()
                 return
 
-            new_cfg = {"TOKEN": e_token.get().strip(), "CHANNEL_ID": channel_id}
+            channel_id = e_channel.get().strip()
+            if channel_id and not channel_id.isdigit():
+                notebook.select(radio_tab)
+                config_error_var.set("Voice Channel ID must contain digits only.")
+                e_channel.focus_set()
+                return
+
+            if mode_var.get() == "native" and sd is None:
+                notebook.select(radio_tab)
+                config_error_var.set(
+                    "Native audio requires the sounddevice package."
+                )
+                return
+
+            new_cfg = normalize_settings(config)
+            new_cfg["playstation"]["ip"] = ps_ip
+            new_cfg["radio"]["mode"] = mode_var.get()
+            new_cfg["radio"]["discord"].update(
+                {
+                    "token": e_token.get().strip(),
+                    "channel_id": channel_id,
+                }
+            )
+            new_cfg["radio"]["native"].update(
+                {
+                    "input_device": input_device_map.get(input_device_var.get()),
+                    "output_device": output_device_map.get(output_device_var.get()),
+                }
+            )
             try:
-                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                    json.dump(new_cfg, f, indent=4)
-                win.destroy()
+                save_bot_config_file(new_cfg)
+                if str(self.ip_entry.cget("state")) == "normal":
+                    self.ip_entry.delete(0, tk.END)
+                    self.ip_entry.insert(0, ps_ip)
+                radio_settings_changed = new_cfg["radio"] != config["radio"]
+                self.config = new_cfg
+                if radio_settings_changed and self.bot_running:
+                    self.stop_bot()
+                close_settings()
             except OSError as e:
                 config_error_var.set(f"Could not save configuration: {e}")
-            
-        tk.Button(win, text="Save & Close", command=save, bg='#00ff00').pack(pady=20)
+
+        ttk.Button(button_frame, text="Cancel", command=close_settings).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(button_frame, text="Save", command=save).pack(side=tk.LEFT)
+
+        win.protocol("WM_DELETE_WINDOW", close_settings)
+        win.bind("<Escape>", lambda _event: close_settings())
+        win.bind("<Control-s>", lambda _event: save())
+        if initial_tab == "radio":
+            notebook.select(radio_tab)
+            if mode_var.get() == "native":
+                input_device_combo.focus_set()
+            else:
+                e_token.focus_set()
+        else:
+            e_ps_ip.focus_set()
+
+    def open_bot_config(self):
+        self.open_settings(initial_tab="radio")
+
+    def set_radio_controls_running(self, mode):
+        mode_label = "Discord" if mode == "discord" else "Native"
+        self.lbl_bot_status.config(text=f"● Radio: {mode_label}", fg='#00ff00')
+        self.btn_bot_toggle.config(
+            text="Disable Radio",
+            bg='#ff4444',
+            fg='white',
+            activebackground='#cc0000',
+            state='normal',
+        )
+
+    def set_radio_controls_stopped(self, error=None):
+        self.bot_running = False
+        if error:
+            self.lbl_bot_status.config(text="● Radio: ERROR", fg='#ff4444')
+        else:
+            self.lbl_bot_status.config(text="● Radio: OFF", fg='gray')
+        self.btn_bot_toggle.config(
+            text="Start Radio",
+            bg='#007bff',
+            fg='white',
+            activebackground='#0056b3',
+            state='normal',
+        )
 
     def toggle_bot(self):
-        # 1. 실행 중이라면 끄기 (빨간 버튼 상태일 때)
         if self.bot_running:
             self.stop_bot()
             return
 
-        # 2. 실행 중이 아니라면 켜기
         self.config = load_bot_config_file()
-        
-        token = str(self.config.get("TOKEN") or "").strip()
-        if not token:
-            self.open_bot_config()
+        radio_config = self.config["radio"]
+        mode = radio_config["mode"]
+        token = str(radio_config["discord"].get("token") or "").strip()
+
+        if mode == "discord" and not token:
+            self.open_settings(initial_tab="radio")
+            return
+        if mode == "native" and sd is None:
+            self.open_settings(initial_tab="radio")
             return
 
-        # --- 버튼을 빨간색 "Disable Radio"로 변경 ---
-        set_radio_ui_state("STARTING", "Starting radio")
-        self.lbl_bot_status.config(text="● Radio: ON", fg='#00ff00')
-        self.btn_bot_toggle.config(
-            text="Disable Radio", 
-            bg='#ff4444', # 빨간색
-            fg='white',
-            activebackground='#cc0000'
-        )
-        
+        mode_label = "Discord" if mode == "discord" else "Native"
+        set_radio_ui_state("STARTING", f"Starting {mode_label} radio", "")
         self.bot_running = True
-        self.bot_thread = threading.Thread(target=self.run_bot_process, args=(token,), daemon=True)
+        self.radio_stop_requested = False
+        self.radio_worker_finished = False
+        self.radio_worker_error = None
+        self.set_radio_controls_running(mode)
+        self.bot_thread = threading.Thread(
+            target=self.run_radio_process,
+            args=(mode, token, self.config),
+            daemon=True,
+        )
         self.bot_thread.start()
 
     def stop_bot(self):
-        """봇을 종료하고 버튼을 다시 파란색으로"""
-        if self.bot:
-            # 봇에게 종료 신호 보냄
-            asyncio.run_coroutine_threadsafe(self.bot.close(), self.bot.loop)
-            
-        self.bot_running = False
-        set_radio_ui_state("OFF", "Radio off", "")
-        self.lbl_bot_status.config(text="● Radio: OFF", fg='#ff0000')
+        self.radio_stop_requested = True
+        bot = self.bot
+        loop = self.bot_loop
+        if bot is not None and loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(bot.close(), loop)
+            except RuntimeError as e:
+                print(f">>> [Radio] Stop request warning: {e}")
+
+        set_radio_ui_state("STOPPING", "Stopping radio", "")
+        self.lbl_bot_status.config(text="● Radio: STOPPING", fg='orange')
         self.btn_bot_toggle.config(
-            text="Start Radio", 
-            bg='#007bff', # 파란색 (원래 색상)
+            text="Stopping...",
+            bg='#555555',
             fg='white',
-            activebackground='#0056b3'
+            activebackground='#555555',
+            state='disabled',
         )
 
-    def run_bot_process(self, token):
+    def run_radio_process(self, mode, token, config):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        # self.config를 빼고 EngineerBot()만 호출하세요.
-        self.bot = EngineerBot() 
-        
+        self.bot_loop = loop
+        bot = None
+
+        async def run_native_radio():
+            async with bot:
+                if self.radio_stop_requested:
+                    return
+                await bot.start_native()
+                if self.radio_stop_requested:
+                    await bot.close()
+                    return
+                await bot.wait_for_native_stop()
+
         try:
-            loop.run_until_complete(self.bot.start(token))
+            bot = EngineerBot(mode=mode, config=config)
+            self.bot = bot
+            if self.radio_stop_requested:
+                loop.run_until_complete(bot.close())
+            elif mode == "native":
+                loop.run_until_complete(run_native_radio())
+            else:
+                loop.run_until_complete(bot.start(token))
         except Exception as e:
-            print(f"Bot Error: {e}")
-            set_radio_ui_state("ERROR", f"Bot error: {e}")
+            self.radio_worker_error = f"{type(e).__name__}: {e}"
+            print(f">>> [Radio] {self.radio_worker_error}")
+            set_radio_ui_state("ERROR", self.radio_worker_error)
         finally:
-            if RADIO_UI_STATE.get("status") != "ERROR":
+            if bot is not None and not bot.is_closed():
+                try:
+                    loop.run_until_complete(bot.close())
+                except Exception as e:
+                    print(f">>> [Radio] Close warning: {e}")
+
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+
+            if not self.radio_worker_error:
                 set_radio_ui_state("OFF", "Radio off", "")
+            if self.bot is bot:
+                self.bot = None
+            self.bot_loop = None
+            self.radio_worker_finished = True
             loop.close()
 
 if __name__ == "__main__":

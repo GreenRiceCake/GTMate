@@ -1,4 +1,17 @@
 {
-    "TOKEN": "",
-    "CHANNEL_ID": ""
+  "schema_version": 2,
+  "playstation": {
+    "ip": ""
+  },
+  "radio": {
+    "mode": "discord",
+    "discord": {
+      "token": "",
+      "channel_id": ""
+    },
+    "native": {
+      "input_device": null,
+      "output_device": null
+    }
+  }
 }
